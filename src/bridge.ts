@@ -38,6 +38,10 @@ import type {
   LocalCallMessage,
   UsageRequestMessage,
   TurnInputMessage,
+  FilesWriteMessage,
+  FilesReadMessage,
+  FilesMoveMessage,
+  FilesPurgeMessage,
 } from './protocol/types.js';
 import { TurnInputPort } from './providers/turn-input.js';
 import { PROTOCOL_VERSION, BRIDGE_VERSION } from './protocol/version.js';
@@ -84,6 +88,7 @@ import {
 } from './attachments/upload.js';
 import { assertAllowedAttachmentUrl, resolveApiOrigin } from './attachments/origin.js';
 import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './attachments/served.js';
+import { FilesRefusal, SPACE_FILES_REVISION, SpaceFiles } from './spacefiles/store.js';
 import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
 import { createLogger } from './utils/logger.js';
@@ -411,6 +416,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    */
   /** The files this bridge will hand back, by the id it minted. */
   private readonly servedFiles: ServedFiles;
+  /** A space's kept files, under the first allowed folder (spacefiles/store.ts). */
+  private readonly spaceFiles: SpaceFiles;
   /** Files going to the server right now, by transfer id, so a cancel can stop one. */
   private readonly fileReads = new Map<string, AbortController>();
   private readonly incomingUploads = new Map<string, {
@@ -537,6 +544,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       : AttachmentCache.disabled();
     this.keepAttachments = options.keepAttachments ?? false;
     this.servedFiles = new ServedFiles(options.servedFilesPath ?? null);
+    this.spaceFiles = new SpaceFiles(this.allowedRootPaths, this.servedFiles);
     this.allowNative = options.allowNative ?? false;
     this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
       ? new UpstreamHub(options.mcpUpstreams, {
@@ -818,6 +826,30 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.send({ type: 'upload_done', id, ok: false, code, error: text });
     } finally {
       this.incomingUploads.delete(id);
+    }
+  }
+
+  /**
+   * One operation on a space's kept files, answered with exactly one
+   * `files_result` on every path (spacefiles/store.ts holds the rules).
+   */
+  private async handleSpaceFiles(
+    message: FilesWriteMessage | FilesReadMessage | FilesMoveMessage | FilesPurgeMessage,
+  ): Promise<void> {
+    const id = typeof message.id === 'string' ? message.id : '';
+    if (!id) return;
+    try {
+      const done = message.type === 'files_write' ? await this.spaceFiles.write(message)
+        : message.type === 'files_read' ? await this.spaceFiles.read(message)
+          : message.type === 'files_move' ? await this.spaceFiles.move(message)
+            : await this.spaceFiles.purge(message);
+      log.info('Space file', { op: message.type, path: done.path, size: done.size });
+      this.send({ type: 'files_result', id, ok: true, ...done });
+    } catch (error) {
+      const code = error instanceof FilesRefusal ? error.code : 'files_failed';
+      const text = error instanceof Error ? error.message : String(error);
+      log.warn('Space file refused', { op: message.type, code, error: text });
+      this.send({ type: 'files_result', id, ok: false, code, error: text });
     }
   }
 
@@ -1267,6 +1299,12 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'turn_input':
         this.handleTurnInput(message);
         break;
+      case 'files_write':
+      case 'files_read':
+      case 'files_move':
+      case 'files_purge':
+        void this.handleSpaceFiles(message);
+        break;
       default:
         log.warn('Unknown message type received', { type: (message as { type: string }).type });
     }
@@ -1467,6 +1505,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // frames (mcp_request/mcp_result, tool_result.ui, welcome tool _meta,
       // provider_tool_call_id). A server reads its absence as "too old".
       mcp_apps: { spec: MCP_APPS_SPEC, revision: MCP_APPS_BRIDGE_REVISION },
+      // A space's kept files (spacefiles/store.ts): the revision of those frames.
+      space_files: SPACE_FILES_REVISION,
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker

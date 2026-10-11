@@ -36,8 +36,8 @@ const DEFAULT_CAPACITY = 20_000;
 export interface ServedFile {
   path: string;
   size: number;
-  /** `upload`: a person sent it here. `handed_back`: the assistant offered it. */
-  source: 'upload' | 'handed_back';
+  /** `upload`: a person sent it here. `handed_back`: the assistant offered it. `space_file`: one of a space's kept files, opened for a person (spacefiles/store.ts). */
+  source: 'upload' | 'handed_back' | 'space_file';
   recorded_at: string;
 }
 
@@ -90,7 +90,7 @@ export class ServedFiles {
       for (const [id, v] of Object.entries(parsed as Record<string, unknown>)) {
         const r = v as Partial<ServedFile>;
         if (typeof r?.path === 'string' && typeof r.size === 'number'
-          && (r.source === 'upload' || r.source === 'handed_back')) {
+          && (r.source === 'upload' || r.source === 'handed_back' || r.source === 'space_file')) {
           this.map.set(id, { path: r.path, size: r.size, source: r.source, recorded_at: String(r.recorded_at ?? '') });
         }
       }

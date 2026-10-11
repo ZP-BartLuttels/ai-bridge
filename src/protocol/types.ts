@@ -271,6 +271,14 @@ export interface HelloMessage {
    * predates them: a server tells the person to update it.
    */
   mcp_apps?: { spec: string; revision: number };
+  /**
+   * This bridge keeps an Engram space's files (`files_write`, `files_read`,
+   * `files_move`, `files_purge`, answered with `files_result`) under
+   * `<first allowed folder>/files/<space>/`. The number is the revision of
+   * those frames (1). Absent from a bridge that predates them: a server tells
+   * the person to update it.
+   */
+  space_files?: number;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -536,7 +544,8 @@ export type BridgeToServerMessage =
   | TurnInputAckMessage
   | UploadDoneMessage
   | FileReadResultMessage
-  | AppResultMessage;
+  | AppResultMessage
+  | FilesResultMessage;
 
 // ---------------------------------------------------------------------------
 // Server -> Bridge Messages
@@ -1119,7 +1128,63 @@ export type ServerToBridgeMessage =
   | StreamCancelMessage
   | CancelMessage
   | TurnInputMessage
-  | AppCallMessage;
+  | AppCallMessage
+  | FilesWriteMessage
+  | FilesReadMessage
+  | FilesMoveMessage
+  | FilesPurgeMessage;
+
+// ---------------------------------------------------------------------------
+// Space files (PROTOCOL.md, "Space files"; src/spacefiles/store.ts)
+// ---------------------------------------------------------------------------
+
+/** Write a new file into a space's folder; never replaces one. Exactly one source. */
+export interface FilesWriteMessage {
+  type: 'files_write';
+  id: string;
+  /** The space's folder: one plain name. */
+  space: string;
+  /** Relative to it, plain names only. */
+  path: string;
+  content_base64?: string;
+  from_file_id?: string;
+  from_path?: string;
+  sha256?: string;
+}
+
+export interface FilesReadMessage {
+  type: 'files_read';
+  id: string;
+  space: string;
+  path: string;
+  sha256?: string;
+  inline_max?: number;
+  serve?: boolean;
+}
+
+/** Move within the space without replacing: into `.bin/`, or back out. */
+export interface FilesMoveMessage {
+  type: 'files_move';
+  id: string;
+  space: string;
+  from: string;
+  to: string;
+  sha256?: string;
+}
+
+/** Remove a file for good; only ever one under `.bin/`. */
+export interface FilesPurgeMessage {
+  type: 'files_purge';
+  id: string;
+  space: string;
+  path: string;
+  sha256?: string;
+}
+
+/** The one answer to each of the four. */
+export type FilesResultMessage =
+  | { type: 'files_result'; id: string; ok: true; path: string; size: number; sha256: string; content_base64?: string; file_id?: string }
+  | { type: 'files_result'; id: string; ok: false; code: string; error: string };
 
 // ---------------------------------------------------------------------------
 // Stream Event Types and Data
