@@ -15,6 +15,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [AI Requests](#ai-requests)
 - [Person uploads](#person-uploads)
 - [Handing files back](#handing-files-back)
+- [Space files](#space-files)
 - [Conversation Continuity](#conversation-continuity)
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
@@ -276,6 +277,14 @@ This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tool
 ```
 
 This bridge implements [MCP Apps](#mcp-apps): `spec` is the ext-apps revision, `revision` the revision of the bridge's own MCP Apps frames. Absent from a bridge that predates them; a server then tells the person to update it and must not send `mcp_request`.
+
+#### Additive field: `space_files`
+
+```json
+{ "type": "hello", "...": "...", "space_files": 1 }
+```
+
+This bridge keeps a server's [space files](#space-files) (`files_write`, `files_read`, `files_move`, `files_purge`); the number is the revision of those frames. Advertised whatever the allow-list says; a bridge with no allowed folder refuses each with `files_no_folder`. Absent from a bridge that predates it: a server tells the person to update it and sends none of the frames.
 
 #### Additive field: `input_closed`
 
@@ -1284,6 +1293,83 @@ Then, unless `head`, 416, or an empty range, the bridge POSTs exactly `end - sta
 ```
 
 The browser went away; stop reading and abort the POST.
+
+## Space files
+
+A server that keeps no file bytes of its own (Engram) keeps each space's files on ONE machine, and asks that machine's bridge to write, read, move and remove them. Everything is under
+
+```
+<first --allow-dir folder>/files/                 (.gitignore of * made with it)
+<first --allow-dir folder>/files/<space>/<path>   a space's files
+<first --allow-dir folder>/files/<space>/.bin/…   its bin
+```
+
+**The rules, enforced here:** `space` is one plain name (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`); `path` is up to 8 plain names joined by `/` (no `..`, no `\`, no control characters, nothing hidden except `.bin` as the first part). Every folder on the way must be a real folder, never a symlink. **Nothing is ever replaced**: a write lands as a hidden `.part` and gets its name with `link`, which fails when the name is taken (`files_exists`); a move is `link` then `unlink`. **Only the bin is ever emptied** (`files_purge` refuses a path not under `.bin/`). Deleting is the server's `files_move` into `.bin/`.
+
+Every request is answered with exactly one `files_result` carrying its `id`.
+
+### Server → Bridge: `files_write`
+
+```json
+{ "type": "files_write", "id": "…", "space": "personal", "path": "contract.v2.pdf",
+  "from_file_id": "b7e2…", "sha256": "9f3c…" }
+```
+
+Exactly one source:
+
+| Field | Meaning |
+|---|---|
+| `content_base64` | The bytes in the frame, at most 512 KB decoded (`files_too_large`). |
+| `from_file_id` | A file this bridge recorded (an upload, a handed-back file), by the id it minted — never a path. |
+| `from_path` | An absolute path on this machine, which must resolve inside an allowed folder and outside `files/` (`files_refused`), to a plain file. |
+
+`sha256`, when given, must match what was written; otherwise `files_failed` and nothing is left.
+
+### Server → Bridge: `files_read`
+
+```json
+{ "type": "files_read", "id": "…", "space": "personal", "path": "notes.txt",
+  "sha256": "…", "inline_max": 262144, "serve": true }
+```
+
+Reads and hashes the file (`lstat` regular file, opened `O_NOFOLLOW`, same inode). A `sha256` that no longer matches is `files_changed`. The bytes come back as `content_base64` only when the file is at most `inline_max` (capped at 512 KB). `serve: true` records the file the way an upload is recorded and answers its `file_id`, so a person can then fetch it with [`file_read`](#handing-files-back).
+
+### Server → Bridge: `files_move`
+
+```json
+{ "type": "files_move", "id": "…", "space": "personal", "from": "notes.txt", "to": ".bin/notes.txt" }
+```
+
+### Server → Bridge: `files_purge`
+
+```json
+{ "type": "files_purge", "id": "…", "space": "personal", "path": ".bin/notes.txt" }
+```
+
+Removes the file for good. Only under `.bin/`.
+
+### Bridge → Server: `files_result`
+
+```json
+{ "type": "files_result", "id": "…", "ok": true, "path": "/home/me/work/files/personal/notes.txt",
+  "size": 5, "sha256": "2cf2…", "content_base64": "aGVsbG8=", "file_id": "…" }
+```
+
+```json
+{ "type": "files_result", "id": "…", "ok": false, "code": "files_exists", "error": "… already exists; nothing is ever replaced." }
+```
+
+| `code` | Meaning |
+|---|---|
+| `files_no_folder` | No `--allow-dir`, so nowhere to keep files. |
+| `files_refused` | A name or path outside the rules, a source outside the allowed folders, a purge outside the bin. |
+| `files_exists` | The target name is taken. |
+| `files_gone` | The file (or the recorded upload) is not there. |
+| `files_changed` | Not a plain file any more, or its digest differs. |
+| `files_too_large` | Inline content over 512 KB. |
+| `files_failed` | Anything else, a digest mismatch on write included. |
+
+`path` (absolute) is for showing to a person; `size` and `sha256` describe the file written or read (for a move or purge, `sha256` echoes the request's).
 
 ## Conversation Continuity
 
