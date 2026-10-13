@@ -286,6 +286,14 @@ This bridge implements [MCP Apps](#mcp-apps): `spec` is the ext-apps revision, `
 
 This bridge keeps a server's [space files](#space-files) (`files_write`, `files_read`, `files_move`, `files_purge`); the number is the revision of those frames. Advertised whatever the allow-list says; a bridge with no allowed folder refuses each with `files_no_folder`. Absent from a bridge that predates it: a server tells the person to update it and sends none of the frames.
 
+#### Additive field: `app_network`
+
+```json
+{ "type": "hello", "...": "...", "app_network": 1 }
+```
+
+This bridge holds every app backend to the hosts its manifest declares, plus Engram's own API, and honours `backend.public_images` ([The network fence](#the-network-fence-0290)); the number is the fence's revision. Absent from a bridge that predates it (before 0.29.0), where `backend.network` is shown to the person but not enforced: a server says so rather than claiming it is held.
+
 #### Additive field: `input_closed`
 
 ```json
@@ -712,7 +720,7 @@ An Engram app may have a backend: code in the app's versioned files, run on the 
 What the bridge does with it (`src/apps/supervisor.ts`):
 
 1. **Working copy.** Keyed on `app.hash`. Each file is fetched as `files.base + sha256`, checked against that hash, and cached by hash under `<local data dir>/apps/blobs/`, so a file unchanged across versions is fetched once. The copy is built beside its final folder and renamed into place. `files.base` and `engram.api` must be on the origin of the server this bridge is connected to (or `--api`), https unless loopback; a path in `tree` is plain segments, never `..`.
-2. **The process.** One per app version on this machine: `node --permission --allow-fs-read=<copy> [--allow-fs-read=<folder>] [--allow-fs-write=<folder with write>] [--allow-child-process when shell or programs] <copy>/<main>`, cwd the copy. Its environment is the same short allowlist local tools get (never the bridge's tokens), the vault roles as `ENGRAM_<ROLE>_<FIELD>` exactly as for [`local_call`](#local-calls), and `ENGRAM_APP_DIR`, `ENGRAM_APP_NAME`, `ENGRAM_APP_VERSION`. A different item chosen for a role restarts the process.
+2. **The process.** One per app version on this machine: `node --permission --allow-fs-read=<copy> --allow-fs-read=<fence> --require <fence> [--allow-net on a Node that has it] [--allow-fs-read=<folder>] [--allow-fs-write=<folder with write>] [--allow-child-process when shell or programs] <copy>/<main>`, cwd the copy. Its environment is the same short allowlist local tools get (never the bridge's tokens, never a proxy variable), the vault roles as `ENGRAM_<ROLE>_<FIELD>` exactly as for [`local_call`](#local-calls), and `ENGRAM_APP_DIR`, `ENGRAM_APP_NAME`, `ENGRAM_APP_VERSION` (and `ENGRAM_IMAGE_FETCH` with `public_images`). A different item chosen for a role, or a different host list, restarts the process. The network is held to `backend.network`, see [The network fence](#the-network-fence-0290).
 3. **Lifetime.** Started by the first request, kept while used, stopped after 10 minutes with no request, stopped with the bridge. A crash fails the requests in flight with the exit status and the tail of its stderr; the next request starts a fresh process. Three crashes within a minute refuse starts for 30 seconds.
 4. **The request.** One JSON line on the process's stdin: `{ "id", "method", "path", "headers", "body", "engram": { "api", "token" }, "vault"? }`. The process answers with one JSON line on stdout: `{ "id", "status", "headers", "body" }` (body a string, at most 256 KB). Requests may overlap; ids match them. A stdout line that is not a response is ignored (logs belong on stderr). No answer in 55 seconds fails the request, not the process.
 
@@ -729,7 +737,20 @@ JSON lines over a pipe rather than a local port or socket, because nothing liste
 
 Exactly one per `app_call`, whatever happens. Every sealed value the process was given is scrubbed from the body, the header values and the error, as for local tools: hygiene, not containment.
 
-**Node only, and what is not confined.** The permission model covers the filesystem and child processes, not the network (Node 22), so `network` is recorded, not enforced; and a child process runs outside the model, so `shell`/`programs` is where the fence ends. Engram's approval prompt says both.
+**Node only, and what is not confined.** The permission model covers the filesystem and child processes; the network is held by the fence below (0.29.0; before it, `network` was recorded, not enforced). A child process runs outside both, so `shell`/`programs` is where the fences end. Engram's approval prompt says so.
+
+### The network fence (0.29.0)
+
+Advertised as `hello.app_network: 1`. A bridge without it does not enforce `backend.network`.
+
+A backend reaches the hosts in `backend.network` on ports 443 and 80, and Engram's own API host on its exact port, and nothing else. Two halves (`src/apps/guard.ts`, `src/apps/egress.ts`):
+
+- **In the backend**, a fence loaded with `--require` before the app's own code replaces the native methods every connection ends in, on their prototypes, non-writable and non-configurable: a TCP connect goes to a loopback relay in the bridge for the port asked for (another port is refused); UDP, Unix sockets and named pipes, listening, and wrapping a descriptor as a TCP or UDP socket are refused; `dns.lookup` answers only declared names (with a stand-in address) and never asks a resolver; `dns.resolve*` is refused; `v8.setFlagsFromString` is refused. `process.binding`, addons, workers, WASI, the inspector and loader hooks are closed by the permission model itself.
+- **In the bridge**, the relay decides where a connection goes. TLS: by the server name in the client hello (no name, or two, is refused); then it only copies bytes. Anything else is parsed as HTTP/1.1 request by request: each request is checked by its own Host header and forwarded on its own, so a kept-alive connection cannot switch hosts; CONNECT, an absolute-URL request target and anything that is not HTTP are refused. The relay resolves the name itself and connects to the address it checked; a declared name that resolves only to loopback, private, link-local, CGNAT or other non-public addresses is refused (Engram's own host is exempt). A refusal is a 403 with `x-engram-refused: network` over HTTP, an `unrecognized_name` alert over TLS, and a line in the bridge's log.
+
+**`backend.public_images: true`** (the manifest's `"public_images": true`): the backend gets `ENGRAM_IMAGE_FETCH` (`http://engram-images.invalid/`) and may ask the bridge to fetch one image: `GET <ENGRAM_IMAGE_FETCH>?url=<http or https address>`. The bridge makes the request itself: GET with no body and none of the app's headers, ports 443 and 80, public addresses only, at most 4 redirects each checked the same way, an `image/*` content type, 3 MB, 10 seconds. The answer is the image (200, its content type) or a 4xx/502 with `x-engram-refused: images` and a sentence. The address itself still reaches the image's host, which is what loading an image from any host means; nothing else of the app's does.
+
+**What it does not hold.** Inside TLS the relay sees nothing: a request to a declared host whose front end also serves other sites (a shared CDN) can name another site in its inner Host header ("domain fronting"); most large front ends refuse a mismatch, but the bridge cannot check it. Data can go out to a declared host itself. A child process (`shell`, `programs`) runs without the fence. The relay's loopback ports can be reached by other programs on the machine, which gets them only this app's declared hosts.
 
 ## Subscription Usage
 
