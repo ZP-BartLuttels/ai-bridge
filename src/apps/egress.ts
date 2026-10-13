@@ -79,6 +79,8 @@ export interface EgressTesting {
   route: (address: string, port: number) => { host: string; port: number } | undefined;
   /** Extra trusted certificates for the image fetcher's own TLS. */
   ca?: string;
+  /** How long a connection may stay silent before it is dropped (HEAD_MS otherwise). */
+  headMs?: number;
 }
 
 export interface Egress {
@@ -118,6 +120,7 @@ export async function startEgress(policy: EgressPolicy, onBlocked: (why: string)
   const sockets = new Set<Socket>();
   const ports: Record<string, number> = {};
   const testing = policy.testing;
+  const headMs = testing?.headMs ?? HEAD_MS;
   const track = (s: Socket) => { sockets.add(s); s.on('close', () => sockets.delete(s)); };
 
   /** 'engram', 'declared', 'images', or why not. */
@@ -159,9 +162,9 @@ export async function startEgress(policy: EgressPolicy, onBlocked: (why: string)
       conn.on('error', () => conn.destroy());
       let head = Buffer.alloc(0);
       const timer = setTimeout(() => {
-        onBlocked(`a connection to port ${target} said nothing it could be checked by within ${HEAD_MS / 1000}s`);
+        onBlocked(`a connection to port ${target} said nothing it could be checked by within ${headMs / 1000}s`);
         conn.destroy();
-      }, HEAD_MS);
+      }, headMs);
       const onData = (chunk: Buffer) => {
         head = Buffer.concat([head, chunk]);
         if (head[0] !== 0x16) {
@@ -256,6 +259,9 @@ export async function startEgress(policy: EgressPolicy, onBlocked: (why: string)
         if (chunked) headers.push('Transfer-Encoding', 'chunked');
         headers.push('Connection', 'close');
         const up: ClientRequest = httpRequest({ host: to.host, port: to.port, method: req.method, path: req.url, headers: headers as unknown as Record<string, string>, agent: false, setHost: false });
+        up.on('socket', (s: Socket) => track(s));
+        // The backend gone (an aborted fetch, a cancelled stream): so is the upstream request.
+        res.on('close', () => { if (!res.writableFinished) up.destroy(); });
         up.on('response', (r) => {
           const out: string[] = [];
           for (let i = 0; i < r.rawHeaders.length; i += 2) {

@@ -16,7 +16,7 @@
 import { createHash } from 'node:crypto';
 import { createServer as createHttpServer, type Server as HttpServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { createServer as createNetServer, type Server as NetServer } from 'node:net';
+import { connect as connectTcp, type Server as NetServer } from 'node:net';
 import { createSocket, type Socket as UdpSocket } from 'node:dgram';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -365,9 +365,24 @@ describe('the network fence of an app backend', () => {
 });
 
 describe('the relay on its own', () => {
-  it('reads the server name of a TLS hello, and refuses two', () => {
+  /** A TLS ClientHello whose server_name extensions carry these names (one inner list per extension). */
+  const hello = (extensions: string[][]): Buffer => {
+    const exts = Buffer.concat(extensions.map((names) => {
+      const list = Buffer.concat(names.map((n) => Buffer.concat([Buffer.from([0, n.length >> 8, n.length & 0xff]), Buffer.from(n)])));
+      const body = Buffer.concat([Buffer.from([list.length >> 8, list.length & 0xff]), list]);
+      return Buffer.concat([Buffer.from([0, 0, body.length >> 8, body.length & 0xff]), body]);
+    }));
+    const hs = Buffer.concat([Buffer.from([3, 3]), Buffer.alloc(32), Buffer.from([0, 0, 2, 0, 0x2f, 1, 0]), Buffer.from([exts.length >> 8, exts.length & 0xff]), exts]);
+    const msg = Buffer.concat([Buffer.from([1, 0, hs.length >> 8, hs.length & 0xff]), hs]);
+    return Buffer.concat([Buffer.from([0x16, 3, 1, msg.length >> 8, msg.length & 0xff]), msg]);
+  };
+  it('reads the server name of a TLS hello, and refuses none, two names, or two extensions', () => {
+    expect(sniOf(hello([['a.test']]))).toBe('a.test');
+    expect(sniOf(hello([]))).toBeNull();
+    expect(sniOf(hello([['a.test', 'b.test']]))).toBeNull();
+    expect(sniOf(hello([['a.test'], ['b.test']]))).toBeNull();
+    expect(sniOf(hello([['a.test']]).subarray(0, 20))).toBeUndefined();
     expect(sniOf(Buffer.from([0x17, 3, 3, 0, 1, 0]))).toBeNull();
-    expect(sniOf(Buffer.from([0x16, 3, 1]))).toBeUndefined();
   });
   it('takes a Host header apart', () => {
     expect(hostOfHeader('api.declared.test:80')).toBe('api.declared.test');
@@ -381,9 +396,18 @@ describe('the relay on its own', () => {
     }
     for (const ip of ['93.184.216.34', '1.1.1.1', '2606:4700::1111', '::ffff:1.1.1.1']) expect(isPublicAddress(ip), ip).toBe(true);
   });
-  it('refuses a connection that says nothing, without hanging the bridge', async () => {
-    const e = await startEgress({ hosts: [], engram: { host: 'engram.test', port: 443 }, testing }, () => {});
+  it('drops a connection that says nothing, without hanging the bridge', async () => {
+    const why: string[] = [];
+    const e = await startEgress({ hosts: [], engram: { host: 'engram.test', port: 443 }, testing: { ...testing, headMs: 100 } }, (w) => why.push(w));
     expect(Object.keys(e.ports).sort()).toEqual(['443', '80']);
+    const closed = await new Promise<boolean>((resolve) => {
+      const s = connectTcp(e.ports['443']!, '127.0.0.1');
+      s.on('close', () => resolve(true));
+      s.on('error', () => {});
+      setTimeout(() => resolve(false), 2000);
+    });
+    expect(closed).toBe(true);
+    expect(why.join(' ')).toMatch(/said nothing/);
     await e.close();
   });
 });
