@@ -43,6 +43,8 @@ import { localCallRefusal, type LocalExecutionConfig } from '../local/gate.js';
 import { scrub, type Redaction } from '../local/scrub.js';
 import { defaultDataDir } from '../local/call.js';
 import { createLogger } from '../utils/logger.js';
+import { IMAGE_HOST, startEgress, type Egress, type EgressTesting } from './egress.js';
+import { GUARD_SOURCE } from './guard.js';
 
 const log = createLogger('Apps');
 
@@ -77,6 +79,8 @@ export interface AppSupervisorOptions {
   dataDir?: string;
   /** The Node binary a backend runs on. */
   nodePath?: string;
+  /** Tests only: see EgressTesting. */
+  egressTesting?: EgressTesting;
 }
 
 interface Pending {
@@ -100,6 +104,8 @@ interface Running {
   child: ChildProcess;
   pending: Map<string, Pending>;
   granted: Redaction[];
+  /** The listeners its connections go through (egress.ts), closed when it exits. */
+  egress: Egress;
   idle?: NodeJS.Timeout;
   stderr: string;
   stopping: boolean;
@@ -192,16 +198,18 @@ export class AppSupervisor {
 
   private async processFor(call: AppCallMessage): Promise<Running> {
     const key = `${call.app.space_id}:${call.app.hash}`;
-    const fillKey = fillFingerprint(call.fill);
+    // The hosts it may reach are part of what the process was started with,
+    // so a host granted or taken back starts a fresh one, as an item does.
+    const fillKey = `${fillFingerprint(call.fill)}|${JSON.stringify(hostsOf(call.backend))}|${call.backend.public_images === true}`;
     const current = this.running.get(key);
     if (current && current.fillKey === fillKey && !current.stopping) return current;
-    if (current) await this.stop(current, 'a different vault item was chosen');
+    if (current) await this.stop(current, 'its vault items or the hosts it may reach changed');
 
     const inFlight = this.starting.get(key);
     if (inFlight) {
       const started = await inFlight;
       if (started.fillKey === fillKey) return started;
-      await this.stop(started, 'a different vault item was chosen');
+      await this.stop(started, 'its vault items or the hosts it may reach changed');
     }
 
     const recent = (this.crashes.get(key) ?? []).filter((t) => Date.now() - t < CRASH_WINDOW_MS);
@@ -223,23 +231,47 @@ export class AppSupervisor {
 
     const env: NodeJS.ProcessEnv = {};
     for (const k of INHERITED) if (process.env[k] !== undefined) env[k] = process.env[k];
-    const own = { ENGRAM_APP_DIR: dir, ENGRAM_APP_NAME: call.app.name, ENGRAM_APP_VERSION: String(call.app.version) };
+    const publicImages = call.backend.public_images === true;
+    const own: Record<string, string> = { ENGRAM_APP_DIR: dir, ENGRAM_APP_NAME: call.app.name, ENGRAM_APP_VERSION: String(call.app.version) };
+    if (publicImages) own.ENGRAM_IMAGE_FETCH = `http://${IMAGE_HOST}/`;
+    const reserved = new Set([...Object.keys(own), 'ENGRAM_NETWORK', 'ENGRAM_IMAGE_FETCH']);
     for (const [k, v] of [...Object.entries(filled.env), ...filled.sealed.map((s) => [s.name, s.value] as const)]) {
-      if (k in own) throw new Error(`the vault role and field that become ${k} collide with a name the bridge sets; rename the role`);
+      if (reserved.has(k)) throw new Error(`the vault role and field that become ${k} collide with a name the bridge sets; rename the role`);
       env[k] = v;
     }
     Object.assign(env, own);
 
-    const args = permissionFlags(dir, call.backend);
-    args.push(join(dir, ...call.backend.main.split('/')));
-    const child = spawn(this.options.nodePath ?? process.execPath, args, {
-      cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+    // The way out (egress.ts), opened before the process exists and closed
+    // when it exits, and the fence that sends every connection there (guard.ts).
+    const api = new URL(this.options.apiOrigin);
+    const egress = await startEgress({
+      hosts: hostsOf(call.backend),
+      engram: { host: api.hostname, port: Number(api.port || (api.protocol === 'https:' ? 443 : 80)) },
+      publicImages,
+      ...(this.options.egressTesting ? { testing: this.options.egressTesting } : {}),
+    }, (why) => log.warn('an app backend was kept to its declared hosts', { app: call.app.name, version: call.app.version, why }));
+    env.ENGRAM_NETWORK = JSON.stringify({
+      ports: egress.ports,
+      hosts: [...hostsOf(call.backend), api.hostname.replace(/^\[|\]$/g, ''), ...(publicImages ? [IMAGE_HOST] : [])],
     });
+
+    let child: ChildProcess;
+    try {
+      const guard = await this.guardFile();
+      const args = permissionFlags(dir, call.backend, guard);
+      args.push(join(dir, ...call.backend.main.split('/')));
+      child = spawn(this.options.nodePath ?? process.execPath, args, {
+        cwd: dir, env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true,
+      });
+    } catch (err) {
+      await egress.close();
+      throw err;
+    }
 
     let exitedResolve!: () => void;
     const running: Running = {
       key, app: call.app.name, version: call.app.version, fillKey, child,
-      pending: new Map(), granted: filled.sealed, stderr: '', stopping: false,
+      pending: new Map(), granted: filled.sealed, egress, stderr: '', stopping: false,
       exited: new Promise<void>((r) => { exitedResolve = r; }),
     };
 
@@ -269,6 +301,7 @@ export class AppSupervisor {
       running.stderr = (running.stderr + `\n${err.message}`).slice(-STDERR_TAIL);
     });
     child.on('exit', (code, signal) => {
+      void egress.close();
       exitedResolve();
       if (this.running.get(key) === running) this.running.delete(key);
       if (running.idle) clearTimeout(running.idle);
@@ -364,6 +397,17 @@ export class AppSupervisor {
     clearTimeout(hard);
   }
 
+  /** The fence's file, content-addressed beside the working copies, written once. */
+  private async guardFile(): Promise<string> {
+    const path = join(this.dataDir, 'runtime', `network-fence-${sha256(Buffer.from(GUARD_SOURCE)).slice(0, 16)}.cjs`);
+    if (existsSync(path) && (await readFile(path, 'utf8')) === GUARD_SOURCE) return path;
+    await mkdir(dirname(path), { recursive: true });
+    const tmp = `${path}.${randomBytes(4).toString('hex')}.tmp`;
+    await writeFile(tmp, GUARD_SOURCE);
+    await rename(tmp, path);
+    return path;
+  }
+
   /* ------------------------------ working copy ------------------------------ */
 
   /**
@@ -431,16 +475,35 @@ export function expandFolder(path: string): string {
   return resolved;
 }
 
+/** The hosts a backend may reach, lowercase and sorted: the manifest's "network" with what was granted. */
+export function hostsOf(backend: AppCallMessage['backend']): string[] {
+  const list = Array.isArray(backend.network) ? backend.network : [];
+  return [...new Set(list.filter((h): h is string => typeof h === 'string').map((h) => h.trim().toLowerCase().replace(/\.$/, '')))].sort();
+}
+
+/** Whether this Node has a network permission (25 and later), which `--permission` then denies unless granted. */
+const NODE_NET_PERMISSION = process.allowedNodeEnvironmentFlags.has('--allow-net');
+
 /**
  * Node's permission model, following the manifest: read the working copy,
  * read (or read and write) each declared folder, and start other programs only
  * when the manifest says it runs a shell or programs. A child process runs
- * WITHOUT the permission model, so `shell` or `programs` is where the fence
- * ends, and the approval prompt says so. Network is not covered by Node 22's
- * model; the declared hosts are shown to the person, not enforced.
+ * WITHOUT the permission model and without the network fence, so `shell` or
+ * `programs` is where both end, and the approval prompt says so.
+ *
+ * The network is fenced by `guard`, loaded before the app (guard.ts), which
+ * sends every connection through the bridge (egress.ts). On a Node with a
+ * network permission of its own, `--allow-net` lets the process open those
+ * connections at all; the fence still decides where they go.
  */
-export function permissionFlags(dir: string, backend: AppCallMessage['backend']): string[] {
+export function permissionFlags(dir: string, backend: AppCallMessage['backend'], guard?: string): string[] {
   const flags = ['--permission', `--allow-fs-read=${dir}`];
+  // The network only with the fence in front of it: without one, a Node that
+  // has a network permission keeps it denied.
+  if (guard) {
+    flags.push(`--allow-fs-read=${guard}`, '--require', guard);
+    if (NODE_NET_PERMISSION) flags.push('--allow-net');
+  }
   for (const f of backend.folders ?? []) {
     const path = expandFolder(f.path);
     flags.push(`--allow-fs-read=${path}`);

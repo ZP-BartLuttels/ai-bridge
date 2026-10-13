@@ -472,8 +472,17 @@ roles), before the bridge is ever asked to run it.
 - **What confines it:** Node's permission model. It reads its own files and the
   folders its manifest lists, writes only where the manifest says, and starts
   other programs only if the manifest says it runs a shell or programs, and a
-  program it starts is NOT confined. The network is not confined at all (Node
-  22 cannot); the hosts it declares are shown to you, not enforced.
+  program it starts is NOT confined.
+- **Its network (0.29.0):** only the hosts its manifest declares, on ports 443
+  and 80, and Engram's own API. Every connection it makes goes through a relay
+  in the bridge that checks which host it is for (the TLS server name, or each
+  HTTP request's Host), resolves the name itself and refuses private and local
+  addresses; UDP, local sockets, listening and DNS for other names are refused
+  inside the process. A manifest with `"public_images": true` may also have
+  the bridge fetch images (GET only, images only, 3 MB) from any public
+  address. What this does not hold: what is said inside TLS to a declared host
+  (a shared front end serving other sites), data sent to a declared host
+  itself, and any program it starts with `shell` or `programs`.
 - **Vault values** reach it as `ENGRAM_<ROLE>_<FIELD>`, like local tools, and
   are scrubbed from what it answers. These are the DEFAULT items you linked to
   the app. For a role that takes several (one account per client), a request

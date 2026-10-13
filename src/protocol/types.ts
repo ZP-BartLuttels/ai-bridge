@@ -279,6 +279,17 @@ export interface HelloMessage {
    * the person to update it.
    */
   space_files?: number;
+  /**
+   * This bridge holds an app backend to the hosts its manifest declares
+   * (`app_call.backend.network`, plus Engram's own API) and to the image
+   * fetcher when `public_images` is set: every TCP connection goes through a
+   * relay in the bridge that checks the name it is for, and UDP, local sockets
+   * and DNS for other names are refused. The number is the revision (1).
+   * Absent from a bridge that predates it, where the hosts are not enforced.
+   * A backend that may run a shell or programs is NOT covered past its own
+   * process: a child process runs outside the fence.
+   */
+  app_network?: number;
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -1045,7 +1056,17 @@ export interface AppCallMessage {
     folders?: { path: string; write: boolean }[];
     shell?: boolean;
     programs?: string[];
+    /**
+     * The hosts the backend may reach (0.29.0: enforced, see hello.app_network).
+     * Engram's own API host and port are always reachable besides these.
+     */
     network?: false | string[];
+    /**
+     * The manifest's `"public_images": true` (0.29.0): the backend may have the
+     * bridge fetch images from any public http(s) address, through
+     * ENGRAM_IMAGE_FETCH (GET only, images only, 3 MB). Absent means no.
+     */
+    public_images?: boolean;
   };
   /** Vault roles, filled as for local tools: ENGRAM_<ROLE>_<FIELD> in the process environment. */
   fill?: ItemFill[];

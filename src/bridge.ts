@@ -89,6 +89,7 @@ import {
 import { assertAllowedAttachmentUrl, resolveApiOrigin } from './attachments/origin.js';
 import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './attachments/served.js';
 import { FilesRefusal, SPACE_FILES_REVISION, SpaceFiles } from './spacefiles/store.js';
+import { APP_NETWORK_REVISION } from './apps/egress.js';
 import { Readable } from 'node:stream';
 import { receiveUpload, type UploadOffer, type UploadSent } from './attachments/receive.js';
 import { createLogger } from './utils/logger.js';
@@ -1507,6 +1508,8 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       mcp_apps: { spec: MCP_APPS_SPEC, revision: MCP_APPS_BRIDGE_REVISION },
       // A space's kept files (spacefiles/store.ts): the revision of those frames.
       space_files: SPACE_FILES_REVISION,
+      // App backends reach only their declared hosts (apps/guard.ts, apps/egress.ts).
+      app_network: APP_NETWORK_REVISION,
       // Follows welcome.desired_bridge_version by itself (src/selfupdate/).
       self_update: this.selfUpdate?.enabled ?? false,
       // Advertise the operator's allow-list so the server can offer a picker
