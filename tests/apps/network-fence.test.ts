@@ -31,6 +31,7 @@ const FIX = join(__dirname, 'fixtures');
 const CERT = readFileSync(join(FIX, 'tls', 'cert.pem'), 'utf8');
 const KEY = readFileSync(join(FIX, 'tls', 'key.pem'), 'utf8');
 const ATTACKER = readFileSync(join(FIX, 'attacker.cjs'), 'utf8');
+const ESM_IMPORTS = readFileSync(join(FIX, 'esm-imports.mjs'), 'utf8');
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
 /** Made-up public addresses the stub resolver hands out. */
@@ -158,18 +159,18 @@ function supervisor(): AppSupervisor {
   return s;
 }
 
-function app(network: string[] | false, extra: Partial<AppCallMessage['backend']> = {}) {
+function app(network: string[] | false, extra: Partial<AppCallMessage['backend']> = {}, main: [string, string] = ['server.cjs', ATTACKER]) {
   const tree: Record<string, string> = {};
-  for (const [path, content] of [['server.cjs', ATTACKER], ['ca.pem', CERT]] as const) {
+  for (const [path, content] of [main, ['ca.pem', CERT]] as const) {
     files.set(sha(content), content);
     tree[path] = sha(content);
   }
-  const hash = sha(`attacker-${JSON.stringify(network)}-${JSON.stringify(extra)}`);
+  const hash = sha(`${main[0]}-${JSON.stringify(network)}-${JSON.stringify(extra)}`);
   return (body: Record<string, unknown>): AppCallMessage => ({
     type: 'app_call', id: `c${Math.random()}`,
     app: { space_id: 'space-1', name: 'attacker', version: 1, hash },
     files: { base: `${origin}/app-blobs/tok/`, tree },
-    backend: { main: 'server.cjs', folders: [], shell: false, programs: [], network, ...extra },
+    backend: { main: main[0], folders: [], shell: false, programs: [], network, ...extra },
     fill: [],
     request: { method: 'POST', path: '/try', headers: {}, body: JSON.stringify(body) },
     engram: { api: `${origin}/app-api`, token: 'tok-1' },
@@ -333,6 +334,23 @@ describe('the network fence of an app backend', () => {
         }, s);
       } finally { delete process.env.HTTPS_PROXY; }
     });
+  });
+
+  // The fence replaces functions on built-in modules; an app written as ES
+  // modules imports them by name, and a name the fence hid from the module's
+  // exports would stop it from starting at all (0.29.0 did, to Engram's Mail).
+  describe('an app written as ES modules', () => {
+    const esm = app(['api.declared.test'], { public_images: true }, ['server.mjs', ESM_IMPORTS]);
+    it('starts with named imports from dns, dns/promises, net, tls, http, https, dgram and v8', () =>
+      check('esm named imports link', { op: 'linked' }, (r) => expect(r).toBe('linked'), fenced, esm));
+    it('gets the fenced functions through them, the same as require does', () =>
+      check('esm imports are the fenced ones', { op: 'same' }, (r) => expect(r).toBe('same'), fenced, esm));
+    it('an imported lookup answers a declared host with the stand-in', () =>
+      check('esm lookup declared', { op: 'lookup', name: 'api.declared.test' }, (r) => expect(r).toBe('resolved:127.0.0.1'), fenced, esm));
+    it('an imported lookup refuses an undeclared host', () =>
+      check('esm lookup undeclared', { op: 'lookup', name: 'evil.test' }, (r) => expect(r).toBe('stopped: ENOTFOUND'), fenced, esm));
+    it('an imported setFlagsFromString is the refusing one', () =>
+      check('esm v8 flags', { op: 'v8flags' }, (r) => expect(r).toMatch(/^stopped: Engram/), fenced, esm));
   });
 
   describe('public images (manifest "public_images": true)', () => {
