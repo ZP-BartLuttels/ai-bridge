@@ -81,7 +81,14 @@ export const GUARD_SOURCE = String.raw`'use strict';
     } catch {}
     return -13;
   })();
-  const lock = (target, key, value) => defineProperty(target, key, { value, writable: false, configurable: false, enumerable: false });
+  const getOwnDescriptor = Object.getOwnPropertyDescriptor;
+  // Keeps the property's enumerability: Node builds a built-in module's ESM
+  // named exports from its ENUMERABLE own keys, so hiding dns.promises.lookup
+  // made "import { lookup } from 'node:dns/promises'" fail to link.
+  const lock = (target, key, value) => {
+    const before = getOwnDescriptor(target, key);
+    defineProperty(target, key, { value, writable: false, configurable: false, enumerable: before ? before.enumerable === true : false });
+  };
   const refuse = (what) => function refused() { say('refused: ' + what); return EACCES; };
   const isIP = require('net').isIP;
 
