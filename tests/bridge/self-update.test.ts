@@ -79,6 +79,12 @@ describe('self-update over the wire', () => {
     expect((await waitFor((f) => f['type'] === 'hello', 'hello'))['self_update']).toBe(true);
   });
 
+  it('hello announces effort_levels, the values options.effort takes', async () => {
+    start();
+    expect((await waitFor((f) => f['type'] === 'hello', 'hello'))['effort_levels'])
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
+  });
+
   it('hello says self_update: false for a bridge that will not', async () => {
     start({ enabled: false, onDesired: () => {} });
     expect((await waitFor((f) => f['type'] === 'hello', 'hello'))['self_update']).toBe(false);

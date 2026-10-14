@@ -297,6 +297,13 @@ export interface HelloMessage {
    * process: a child process runs outside the fence.
    */
   app_network?: number;
+  /**
+   * The values `options.effort` takes: `["low","medium","high","xhigh","max"]`,
+   * passed to Claude as `--effort <level>`. Claude only; Codex and Gemini ignore
+   * the option. Absent from a bridge that predates it, which drops the option
+   * and runs the turn at the CLI's default.
+   */
+  effort_levels?: string[];
 }
 
 /** Attachment caps as reported in `hello`. Bytes, not megabytes: no rounding on either side. */
@@ -1023,6 +1030,12 @@ export interface AiRequestOptions {
    * about the turn differs from one that did not ask.
    */
   accepts_input?: boolean | null;
+  /**
+   * Thinking level for the turn: one of `hello.effort_levels`, passed to Claude
+   * as `--effort <level>`. Any other value is ignored (the turn still runs, at
+   * the CLI's default). Claude only.
+   */
+  effort?: string | null;
 }
 
 /** Server responds with the result of a tool call. */

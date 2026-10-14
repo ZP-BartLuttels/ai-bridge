@@ -311,6 +311,14 @@ This bridge holds every app backend to the hosts its manifest declares, plus Eng
 
 This bridge sends the [`input_closed`](#input_closed) stream event when a turn with its input open stops taking messages. A bridge without it still closes the input by the terminal rule but says nothing — and it may close it too early, before the CLI has read the opening message (see the terminal rule under [`accepts_input`](#additive-option-accepts_input--a-turn-that-takes-messages-while-it-runs)). A server can then learn of the close only from a `turn_input` answered `turn_ending`, or from the terminal frame. An older server ignores the field and the event.
 
+#### Additive field: `effort_levels`
+
+```json
+{ "type": "hello", "...": "...", "effort_levels": ["low", "medium", "high", "xhigh", "max"] }
+```
+
+The values this bridge takes for [`options.effort`](#additive-option-effort--the-claude-thinking-level), the Claude thinking level. Sent whichever providers are detected; Codex and Gemini ignore the option. Absent from a bridge that predates it, which drops the option and runs every turn at the CLI's default: a server that lets a person pick a level says it was not applied rather than implying it was.
+
 ### Bridge → Server: `providers_update`
 
 Sent mid-connection when the bridge's set of available provider CLIs changes after the `hello` — for example, the user installs or removes a CLI while the bridge stays connected.
@@ -928,6 +936,16 @@ What changes for such a turn:
 - **Stopping the turn stops what it started.** Every CLI is spawned as the leader of its own process group, and a `cancel` or a bound signals the group (SIGINT, then SIGTERM, then SIGKILL, as before). Claude Code runs each shell command in a session of its own, so on the last step the bridge also kills the groups of the CLI's descendants — found while they are still its descendants — because a SIGKILLed CLI cannot stop its own background commands. Accepted messages not yet read are dropped with the turn and named in `cancelled.pending_inputs`.
 
 It is still one process per turn: the process ends when the turn does. There is no long-lived process per conversation.
+
+#### Additive option: `effort` — the Claude thinking level
+
+```json
+"options": { "effort": "high" }
+```
+
+Claude only. One of `hello.effort_levels` — `low`, `medium`, `high`, `xhigh`, `max` — and the bridge starts the CLI with `--effort <level>`, on a fresh turn and on a resumed one alike (like `--model`, it is per invocation, so a server sends it on every turn it wants it for). Verified on Claude Code 2.1.287, also together with `--resume`.
+
+Any other value is **ignored**, logged at debug: the turn runs exactly as if the option were absent, at the CLI's default level, and nothing is reported to the server. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.effort_levels`.
 
 #### Additive field: `working_dir`
 
@@ -2715,6 +2733,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Helper activity does not bump the version either.** `parent_tool_use_id` on `block_start` and `tool_result`, the `task` stream event and `done.subagent_stats` are additive: absent means what it always meant, and a consumer ignores an event it does not know.
 
 **Person uploads and handing files back do not bump the version.** `hello.file_uploads`, `hello.file_downloads`, the four `upload_*` frames and the three `file_read*` frames are additive; a server must not send `upload_offer` to a bridge that did not advertise `file_uploads`.
+
+**The thinking level does not bump the version.** `hello.effort_levels` and `options.effort` are additive: an older bridge ignores the option, and an older server ignores the field.
 
 **Announcing the input's close does not bump the version.** `hello.input_closed` and the `input_closed` stream event are additive: a consumer ignores an event it does not know, and a server that does not see the flag learns the close the way it always did, from `turn_ending`.
 

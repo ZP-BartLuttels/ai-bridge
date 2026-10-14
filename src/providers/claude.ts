@@ -68,6 +68,7 @@ import { stopTurn, stoppedByUs } from './stop.js';
 import { userMessageFrame } from './turn-input.js';
 import { createTaskOutputWatch, outputPathFrom } from './task-output-watch.js';
 import { prepareClaudeSubagentPrompt, type SubagentPromptFileHandle } from './subagent-prompt.js';
+import { resolveClaudeEffort } from './claude-effort.js';
 
 /**
  * How long a turn with its input open waits for the CLI to start the turn it
@@ -222,6 +223,13 @@ export class ClaudeAdapter extends ProviderAdapter {
     // Add model if specified in request options
     if (request.options?.model) {
       args.push('--model', request.options.model);
+    }
+
+    // Thinking level (`options.effort`), on fresh and resumed turns alike:
+    // like --model it is per-invocation. An unknown level is dropped, never fatal.
+    const effort = resolveClaudeEffort(request.options?.effort);
+    if (effort !== null) {
+      args.push('--effort', effort);
     }
 
     // Add max tokens if specified

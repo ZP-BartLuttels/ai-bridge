@@ -497,6 +497,10 @@ backends".
 
 A server can add text to the system prompt of every subagent Claude starts in a turn with the optional `subagent_prompt` string on `ai_request` (next to `system_prompt`, which only reaches the main assistant). The Claude adapter writes it to a temp file, passes `--append-subagent-system-prompt-file <file>`, and deletes it when the turn ends. Nested subagents get it; forks do not (they reuse the main system prompt). Needs Claude Code 2.1.261+; on an older CLI the flag is skipped with a warning. Codex and Gemini ignore it. Details in [PROTOCOL.md](PROTOCOL.md#additive-field-subagent_prompt--text-for-every-subagent).
 
+## Thinking level per request
+
+A server can pick Claude's thinking level for a turn with `options.effort` on `ai_request`: one of `low`, `medium`, `high`, `xhigh`, `max`, passed as `--effort <level>` on fresh and resumed turns. Any other value is ignored (logged at debug) and the turn runs at the CLI's default; no value changes nothing. The bridge lists the levels in `hello.effort_levels`. Codex and Gemini ignore it. Details in [PROTOCOL.md](PROTOCOL.md#additive-option-effort--the-claude-thinking-level).
+
 ## MCP servers of your own (MCP Apps)
 
 `--mcp-upstreams <file>` makes the bridge an MCP client of servers you choose
