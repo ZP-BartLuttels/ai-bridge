@@ -97,7 +97,7 @@ describe('createTaskOutputWatch()', () => {
     watch.stop(); // idempotent
   });
 
-  it('watches nothing for a reply without a path, a sub-agent\'s task, or another task type', async () => {
+  it('watches nothing for a reply without a path, or another task type', async () => {
     const path = join(scratch(), 'b1.output');
     writeFileSync(path, 'output\n');
     let growths = 0;
@@ -106,19 +106,45 @@ describe('createTaskOutputWatch()', () => {
     const noPath = make();
     noPath.started(startedFrame());
     noPath.toolResult('toolu_1', 'Command running in background with ID: b1.');
-    const subagent = make();
-    subagent.started(startedFrame({ owned_by_subagent: true }));
-    subagent.toolResult('toolu_1', reply(path));
     const agentTask = make();
     agentTask.started(startedFrame({ task_type: 'local_agent' }));
     agentTask.toolResult('toolu_1', reply(path));
+    // A command that ran in the foreground: its reply is its output, no file.
     const foreground = make();
     foreground.started(startedFrame({ is_backgrounded: false }));
-    foreground.toolResult('toolu_1', reply(path));
+    foreground.toolResult('toolu_1', 'v1.4.2\n');
 
     await sleep(350);
     expect(growths).toBe(0);
-    for (const w of [noPath, subagent, agentTask, foreground]) w.stop();
+    for (const w of [noPath, agentTask, foreground]) w.stop();
+  });
+
+  it('watches a helper\'s command, and one moved to the background after it started, the same way', async () => {
+    // A helper's command holds the turn open like the main assistant's, so its
+    // progress counts the same (D09379). And a command the model ran in the
+    // foreground is moved to the background when it outlives its tool timeout:
+    // its task_started still says is_backgrounded false, and only the reply
+    // naming an output file says it now runs in the background.
+    const make = (frame: Record<string, unknown>, text: (path: string) => string) => {
+      const path = join(scratch(), 'b1.output');
+      writeFileSync(path, 'output\n');
+      let growths = 0;
+      const watch = createTaskOutputWatch({ silenceSeconds: 0.4, onGrowth: () => { growths++; }, log: quietLog, requestId: 'r' });
+      watch.started(startedFrame(frame));
+      watch.toolResult('toolu_1', text(path));
+
+      return { watch, growths: () => growths };
+    };
+    const helper = make({ owned_by_subagent: true }, reply);
+    const moved = make({ is_backgrounded: false }, (path) =>
+      'Command did not complete within its 600s timeout and was moved to the background (ID: b1). '
+      + `Output is being written to: ${path}. You will be notified when it completes.`);
+
+    await sleep(350);
+    expect(helper.growths()).toBe(1);
+    expect(moved.growths()).toBe(1);
+    helper.watch.stop();
+    moved.watch.stop();
   });
 
   it('survives an output file that never appears', async () => {
@@ -147,22 +173,37 @@ describe('createTaskOutputWatch()', () => {
 describe('an input turn waiting on a background command', () => {
   const SILENCE_S = 1;
 
-  /** The CLI starts a background command, finishes its reply, then says nothing for `quietMs`. */
-  function script(toolResultText: string, quietMs: number): Step[] {
+  /**
+   * The CLI starts a background command, finishes its reply, then says nothing
+   * for `quietMs`. With `byHelper`, a background helper still at work started
+   * the command, and ends once the command has.
+   */
+  function script(toolResultText: string, quietMs: number, byHelper = false): Step[] {
     const line = (frame: unknown): Step => ({ line: JSON.stringify(frame) });
+    const helper = byHelper
+      ? [line({
+        type: 'system', subtype: 'task_started', task_id: 'a1', tool_use_id: 'toolu_agent',
+        description: 'release helper', is_backgrounded: true, task_type: 'local_agent', session_id: 's1',
+      })]
+      : [];
+    const helperEnds = byHelper
+      ? [line({ type: 'system', subtype: 'task_notification', task_id: 'a1', tool_use_id: 'toolu_agent', status: 'completed', session_id: 's1' })]
+      : [];
 
     return [
       line({ type: 'system', subtype: 'init', session_id: 's1', model: 'claude-test' }),
-      line(startedFrame({ session_id: 's1' })),
+      ...helper,
+      line(startedFrame({ session_id: 's1', ...(byHelper ? { owned_by_subagent: true } : {}) })),
       line({
         type: 'user',
         message: { role: 'user', content: [{ tool_use_id: 'toolu_1', type: 'tool_result', content: toolResultText }] },
-        parent_tool_use_id: null,
+        parent_tool_use_id: byHelper ? 'toolu_agent' : null,
         session_id: 's1',
       }),
       line({ type: 'result', subtype: 'success', is_error: false, result: 'Started.', session_id: 's1' }),
       { sleep: quietMs },
       line({ type: 'system', subtype: 'task_updated', task_id: 'b1', patch: { status: 'completed' }, session_id: 's1' }),
+      ...helperEnds,
       line({ type: 'result', subtype: 'success', is_error: false, result: 'Released.', session_id: 's1' }),
       { exit: 0 },
     ];
@@ -186,6 +227,22 @@ describe('an input turn waiting on a background command', () => {
     try {
       const { events } = await runInputTurn({
         steps: script(reply(path), 3000),
+        message: 'release it',
+        silenceTimeoutSeconds: SILENCE_S,
+      });
+      expect(silenceErrors(events)).toEqual([]);
+      expect(of(events, 'done')).toHaveLength(1);
+    } finally {
+      stop();
+    }
+  }, 15_000);
+
+  it('is not stopped while a helper\'s command keeps writing output either (D09379)', async () => {
+    const path = join(scratch(), 'b1.output');
+    const stop = grow(path, 10_000);
+    try {
+      const { events } = await runInputTurn({
+        steps: script(reply(path), 3000, true),
         message: 'release it',
         silenceTimeoutSeconds: SILENCE_S,
       });

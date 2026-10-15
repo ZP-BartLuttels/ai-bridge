@@ -554,9 +554,37 @@ export class ClaudeAdapter extends ProviderAdapter {
       };
 
       /**
+       * How many of the running tasks are commands left behind by helpers that
+       * have all finished: shell commands a helper started (`owned_by_subagent`),
+       * while no helper (`local_agent`) of this turn is still running. Zero
+       * while any helper runs, because then its commands are its own work.
+       *
+       * Such a command reports to the helper that started it, and that helper
+       * is gone: nothing will ever read its result. Holding the turn open for it
+       * only waited out the silence bound — the answer delivered, then 900 s of
+       * nothing, then `silence_timeout_exceeded`, every time a helper left a
+       * "wait until ready" loop behind (2026-10-07 and -14, 0.29.0). With stdin
+       * closed the CLI stops such a command itself and exits (captured on
+       * 2.1.280: `task_updated` killed, `task_notification` stopped, exit 0,
+       * 5 s after the close), which is exactly what the bound did, minus the
+       * wait and the error.
+       */
+      const helpersLeftovers = (): number => {
+        let leftovers = 0;
+        for (const taskId of runningTasks) {
+          const task = startedTasks.get(taskId);
+          if (task?.taskType === 'local_agent') return 0;
+          if (task?.ownedBySubagent === true) leftovers++;
+        }
+
+        return leftovers;
+      };
+
+      /**
        * The terminal rule, for input-open turns: close stdin only when the main
        * assistant is idle, NO task it or a helper started is still running
-       * (any task_type), and every accepted message has been read — the
+       * (any task_type) — except commands a finished helper left behind, see
+       * helpersLeftovers() — and every accepted message has been read — the
        * opening message too (see openingTakenIn). A `result`
        * is not the end: with stdin open the CLI writes one each time the main
        * assistant finishes a message, including while a background task works
@@ -570,7 +598,9 @@ export class ClaudeAdapter extends ProviderAdapter {
         // keeping the assistant `working` meanwhile would already stop the
         // close; checked here as well so the rule does not hinge on that.
         if (!openingTakenIn) return;
-        if (mainState !== 'idle' || runningTasks.size > 0 || (port?.pendingCount() ?? 0) > 0) return;
+        if (mainState !== 'idle' || (port?.pendingCount() ?? 0) > 0) return;
+        const leftovers = helpersLeftovers();
+        if (runningTasks.size > leftovers) return;
         if (notificationOwed) {
           graceTimer ??= setTimeout(() => {
             graceTimer = null;
@@ -583,7 +613,12 @@ export class ClaudeAdapter extends ProviderAdapter {
 
           return;
         }
-        closeInput('idle, no task running, no message pending', 'idle');
+        closeInput(
+          leftovers > 0
+            ? `idle, only finished helpers' leftovers running (${leftovers}), no message pending`
+            : 'idle, no task running, no message pending',
+          'idle',
+        );
       };
 
       /**
@@ -1661,6 +1696,12 @@ interface StartedTask {
   toolUseId: string | undefined;
   /** `local_agent`, `local_bash`… — named by the CLI only at start. */
   taskType: string | undefined;
+  /**
+   * Started by a helper rather than by the main assistant (`owned_by_subagent`
+   * on `task_started`): a shell command a helper ran. Read by the terminal rule,
+   * which does not let such a command hold the turn open once no helper is left.
+   */
+  ownedBySubagent: boolean;
 }
 
 /** The CLI's `system` subtypes for a task's life, and the phase each becomes. */
@@ -1737,7 +1778,11 @@ function taskEventFrom(frame: Record<string, unknown>, started: Map<string, Star
     // every later phase, like one this process never saw start: `started` got
     // through and its `progress` and `finished` were dropped, so a consumer
     // drew a helper that ran forever.
-    known = { toolUseId, taskType: strOf(frame, 'task_type') };
+    known = {
+      toolUseId,
+      taskType: strOf(frame, 'task_type'),
+      ownedBySubagent: frame['owned_by_subagent'] === true,
+    };
     started.set(taskId, known);
   } else if (known !== undefined) {
     // A later phase that names the call teaches it to a task that started

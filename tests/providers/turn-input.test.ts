@@ -198,6 +198,84 @@ describe('messages for a running turn', () => {
     expect(of(turn.events, 'done')).toHaveLength(1);
   });
 
+  describe('commands a finished helper left behind (D09379)', () => {
+    /** A shell command a helper started: the CLI marks it `owned_by_subagent`. */
+    const helperCommand = (id: string): Step => line({
+      type: 'system', subtype: 'task_started', task_id: id, tool_use_id: `toolu_${id}`,
+      task_type: 'local_bash', is_backgrounded: true, owned_by_subagent: true, description: id,
+    });
+    /** What the CLI writes for such a command once stdin is closed (captured, 2.1.280). */
+    const killedOnClose = (id: string): Step[] => [
+      line({ type: 'system', subtype: 'task_updated', task_id: id, patch: { status: 'killed' } }),
+      line({ type: 'system', subtype: 'task_notification', task_id: id, tool_use_id: `toolu_${id}`, status: 'stopped' }),
+    ];
+
+    it('do not hold the turn open once the main assistant is idle and no helper runs', async () => {
+      // The incident, in frames: the helper starts a "wait until ready" loop in
+      // the background and finishes; the main assistant answers the helper's
+      // end and is idle; the loop prints nothing. It used to hold stdin open
+      // until the silence bound stopped the turn as an error.
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('a1', 'local_agent', true),
+          text('Launched.'), result(),
+          helperCommand('b1'),
+          taskFinished('a1'),
+          init, text('The review is done.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+          ...killedOnClose('b1'),
+        ],
+      });
+
+      // Lines: echo, init, helper, text, result (5) | command (6) | helper
+      // ends (7) | init, text, result (10). Closed right after that result,
+      // with the command still running.
+      expect(turn.record.eofAt).toBe(10);
+      expect(of(turn.events, 'input_closed')).toHaveLength(1);
+      expect(of(turn.events, 'done')).toHaveLength(1);
+      expect(of(turn.events, 'error')).toEqual([]);
+    });
+
+    it('still hold it while the helper that started them is at work', async () => {
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('a1', 'local_agent', true),
+          text('Launched.'), result(),
+          helperCommand('b1'), { sleep: 150 },
+          // Nothing may have closed stdin yet: the helper still works.
+          taskFinished('b1'), taskFinished('a1'),
+          init, text('The review is done.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+        ],
+      });
+
+      // Closed only after the helper ended (line 8) and its answer (line 11).
+      expect(turn.record.eofAt).toBe(11);
+      expect(of(turn.events, 'done')).toHaveLength(1);
+    });
+
+    it('change nothing for a command the main assistant left running', async () => {
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('b1', 'local_bash', true),
+          text('Started.'), result(), { sleep: 150 },
+          taskFinished('b1'), { sleep: 150 },
+          init, text('It printed done.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+        ],
+      });
+
+      // As in 'keeps stdin open for a local_bash task': not before its end.
+      expect(turn.record.eofAt).toBeGreaterThanOrEqual(8);
+    });
+  });
+
   it('does not close stdin while an accepted message is still unread, then closes when drained', async () => {
     let offered = false;
     const turn = await runInputTurn({
