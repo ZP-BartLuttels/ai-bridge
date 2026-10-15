@@ -89,6 +89,13 @@ export function startTurnTimeouts(opts: {
   silenceSeconds: number;
   requestSeconds: number;
   onFire: (reason: TimeoutReason, limitSeconds: number) => void;
+  /**
+   * Asked first when the silence bound runs out. Returning true means the
+   * adapter ended the turn gently itself; the bound does not fire, and the
+   * silence clock starts over, so a turn that still does not end is stopped
+   * at the next run-out (onSilence is not asked again).
+   */
+  onSilence?: () => boolean;
 }): TurnTimeouts {
   let fired: TimeoutReason | null = null;
   let firedLimit: number | null = null;
@@ -98,6 +105,7 @@ export function startTurnTimeouts(opts: {
   // already over, and later logged a false timeout and signalled a dead child.
   let cancelled = false;
   let silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  let softTried = false;
 
   const fire = (reason: TimeoutReason, limitSeconds: number) => {
     // First one wins. Both clocks can be close together, and killing twice
@@ -110,10 +118,17 @@ export function startTurnTimeouts(opts: {
 
   const armSilence = () => {
     if (!Number.isFinite(opts.silenceSeconds) || opts.silenceSeconds <= 0) return;
-    silenceTimer = setTimeout(
-      () => fire('silence_timeout_exceeded', opts.silenceSeconds),
-      opts.silenceSeconds * 1000,
-    );
+    silenceTimer = setTimeout(() => {
+      if (!softTried && opts.onSilence !== undefined) {
+        softTried = true;
+        if (opts.onSilence()) {
+          armSilence();
+
+          return;
+        }
+      }
+      fire('silence_timeout_exceeded', opts.silenceSeconds);
+    }, opts.silenceSeconds * 1000);
     silenceTimer.unref?.();
   };
 
