@@ -66,7 +66,7 @@ import { supportsPartialMessages, noteCliRejectedPartialFlag } from './claude-ca
 import { createLogger, isDebugEnabled } from '../utils/logger.js';
 import { stopTurn, stoppedByUs } from './stop.js';
 import { userMessageFrame } from './turn-input.js';
-import { createTaskOutputWatch } from './task-output-watch.js';
+import { createTaskOutputWatch, outputPathFrom } from './task-output-watch.js';
 import { prepareClaudeSubagentPrompt, type SubagentPromptFileHandle } from './subagent-prompt.js';
 
 /**
@@ -529,8 +529,31 @@ export class ClaudeAdapter extends ProviderAdapter {
         }
       };
 
+      /**
+       * A main-assistant command run in the foreground is moved to the
+       * background when it outlives its tool timeout. Its `task_started` was
+       * written before that, without `is_backgrounded`, so trackTask() did not
+       * count it as a background task — and when it ended, nothing waited for
+       * the turn in which the CLI hands the main assistant its result: the
+       * input could close first and the result was never read. The reply to
+       * the call says it ("…moved to the background… Output is being written
+       * to: …"), as it does for every command running in the background, so
+       * the reply is what decides. A foreground reply names no file.
+       */
+      const noteMovedToBackground = (toolUseId: string, text: string): void => {
+        if (outputPathFrom(text) === null) return;
+        for (const taskId of runningTasks) {
+          const task = startedTasks.get(taskId);
+          if (task?.toolUseId !== toolUseId) continue;
+          if (task.ownedBySubagent || task.taskType !== 'local_bash') return;
+          mainBackgroundTasks.add(taskId);
+
+          return;
+        }
+      };
+
       /** Close stdin: the CLI finishes what it has, then exits, then `done`. */
-      const closeInput = (why: string, reason: InputClosedData['reason']): void => {
+      const closeInput = (why: string, reason: InputClosedData['reason'], stoppedTasks?: number): void => {
         if (stdinClosed) return;
         stdinClosed = true;
         if (graceTimer !== null) clearTimeout(graceTimer);
@@ -545,12 +568,44 @@ export class ClaudeAdapter extends ProviderAdapter {
         // turn. Once per turn (the stdinClosed latch above), never after
         // `done`, and through the deferral queue like `main_state`, so it
         // keeps its place among the events around it and counts as activity.
-        if (acceptsInput && !settled) emitWholeMessage({ event: 'input_closed', data: { reason } });
+        if (acceptsInput && !settled) {
+          emitWholeMessage({
+            event: 'input_closed',
+            data: stoppedTasks === undefined ? { reason } : { reason, stopped_tasks: stoppedTasks },
+          });
+        }
         try {
           child.stdin?.end();
         } catch {
           // Already closed with the process.
         }
+      };
+
+      /**
+       * How many of the running tasks are commands left behind by helpers that
+       * have all finished: shell commands a helper started (`owned_by_subagent`),
+       * while no helper (`local_agent`) of this turn is still running. Zero
+       * while any helper runs, because then its commands are its own work.
+       *
+       * Such a command STILL HOLDS THE TURN OPEN. A finished helper is not gone:
+       * when its background command ends, the CLI wakes it with the
+       * notification, and it reads the result and carries on — "run the check
+       * in the background, then commit and merge" is the ordinary shape of a
+       * helper's work (seen on 2.1.283, 2026-10-15: one helper was woken four
+       * times this way after reporting itself completed). Closing stdin early
+       * would make the CLI kill that command and the work would silently never
+       * finish. Read only when the silence bound runs out: see
+       * softEndOnSilence().
+       */
+      const helpersLeftovers = (): number => {
+        let leftovers = 0;
+        for (const taskId of runningTasks) {
+          const task = startedTasks.get(taskId);
+          if (task?.taskType === 'local_agent') return 0;
+          if (task?.ownedBySubagent === true) leftovers++;
+        }
+
+        return leftovers;
       };
 
       /**
@@ -587,6 +642,41 @@ export class ClaudeAdapter extends ProviderAdapter {
       };
 
       /**
+       * The silence bound ran out. When the main assistant has answered and the
+       * ONLY things still running are commands left behind by finished helpers,
+       * end the turn gently instead of killing it: close stdin, and the CLI stops
+       * those commands itself and exits (captured on 2.1.280: `task_updated`
+       * killed, `task_notification` stopped, exit 0, about 5 s after the close),
+       * so the turn ends as an ordinary `done`. Announced as `input_closed`
+       * with reason `leftovers_silent` and how many were stopped, so a consumer
+       * can say so without showing an error under a finished answer.
+       *
+       * Such a command had the whole bound to make progress (its output
+       * growing counts, see task-output-watch.ts), so what is stopped here is a
+       * command that went quiet for 15 minutes — usually one that would never
+       * end: a wait loop whose pgrep matched itself, or one waiting for this
+       * very turn to end (2026-10-13 and -15). Returns false, and the bound
+       * kills the turn as before, in every other case. The clock is re-armed,
+       * so a CLI that does not exit after the close is still stopped.
+       */
+      const softEndOnSilence = (): boolean => {
+        if (!acceptsInput || stdinClosed || settled || !openingTakenIn) return false;
+        if (mainState !== 'idle' || (port?.pendingCount() ?? 0) > 0) return false;
+        const leftovers = helpersLeftovers();
+        if (leftovers === 0 || runningTasks.size > leftovers) return false;
+        log.warn('Silent with only finished helpers\' commands running — closing the input instead of killing', {
+          requestId, leftovers,
+        });
+        closeInput(
+          `idle, only finished helpers' leftovers running (${leftovers}), silent for the bound`,
+          'leftovers_silent',
+          leftovers,
+        );
+
+        return true;
+      };
+
+      /**
        * Start taking messages. Called at the CLI's FIRST `system/init`, not at
        * spawn: until then the CLI may yet fail before it has a session — a
        * resumed session it cannot find ends the process there — and a message
@@ -612,6 +702,7 @@ export class ClaudeAdapter extends ProviderAdapter {
       timeouts = startTurnTimeouts({
         silenceSeconds: context.silenceTimeoutSeconds,
         requestSeconds: context.requestTimeoutSeconds,
+        onSilence: () => softEndOnSilence(),
         onFire: (reason, limitSeconds) => {
           log.warn('Turn timed out — killing claude process', {
             requestId,
@@ -912,6 +1003,7 @@ export class ClaudeAdapter extends ProviderAdapter {
             const resultText = flattenToolResult(entry['content']);
             // A backgrounded command's reply names the file its output goes to.
             taskOutput.toolResult(toolUseId, resultText);
+            noteMovedToBackground(toolUseId, resultText);
             // Through the deferral queue like every other whole-message event.
             // A backgrounded sub-agent reports its results while the main agent
             // is still writing, so emitting directly put tool output inside an
@@ -1661,6 +1753,12 @@ interface StartedTask {
   toolUseId: string | undefined;
   /** `local_agent`, `local_bash`… — named by the CLI only at start. */
   taskType: string | undefined;
+  /**
+   * Started by a helper rather than by the main assistant (`owned_by_subagent`
+   * on `task_started`): a shell command a helper ran. Read by the terminal rule,
+   * which does not let such a command hold the turn open once no helper is left.
+   */
+  ownedBySubagent: boolean;
 }
 
 /** The CLI's `system` subtypes for a task's life, and the phase each becomes. */
@@ -1737,7 +1835,11 @@ function taskEventFrom(frame: Record<string, unknown>, started: Map<string, Star
     // every later phase, like one this process never saw start: `started` got
     // through and its `progress` and `finished` were dropped, so a consumer
     // drew a helper that ran forever.
-    known = { toolUseId, taskType: strOf(frame, 'task_type') };
+    known = {
+      toolUseId,
+      taskType: strOf(frame, 'task_type'),
+      ownedBySubagent: frame['owned_by_subagent'] === true,
+    };
     started.set(taskId, known);
   } else if (known !== undefined) {
     // A later phase that names the call teaches it to a task that started

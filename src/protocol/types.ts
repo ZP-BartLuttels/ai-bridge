@@ -1434,7 +1434,14 @@ export interface MainStateData {
  * accept one it does not know, since a later bridge may add others.
  */
 export interface InputClosedData {
-  reason: 'idle';
+  /**
+   * `idle`: the terminal rule closed it. `leftovers_silent`: the silence bound
+   * ran out while the main assistant had answered and only commands left
+   * behind by finished helpers were running; the CLI stops those and exits.
+   */
+  reason: 'idle' | 'leftovers_silent';
+  /** With `leftovers_silent`: how many such commands were stopped. */
+  stopped_tasks?: number;
 }
 
 /**

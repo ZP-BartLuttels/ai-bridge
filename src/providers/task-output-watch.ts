@@ -2,10 +2,10 @@
  * Count a background shell task's output as activity for the silence clock.
  *
  * A turn is stopped as silent after `silenceSeconds` in which the CLI writes
- * nothing. A main-assistant background `local_bash` task writes nothing to the
- * stream while it runs — no `task_progress`, no heartbeat; those exist only for
- * sub-agents — so a backgrounded command that is visibly making progress looked
- * exactly like a hung CLI. The terminal rule held the turn open BECAUSE the
+ * nothing. A background `local_bash` task writes nothing to the stream while it
+ * runs — no `task_progress`, no heartbeat; those exist only for sub-agents — so
+ * a backgrounded command that is visibly making progress looked exactly like a
+ * hung CLI. The terminal rule held the turn open BECAUSE the
  * task was running, and the silence clock then killed it for waiting on that
  * same task (2026-09-29: a release watcher printing a line every 33 s, killed
  * at 900 s with all the work done).
@@ -15,6 +15,17 @@
  * hung `sleep 99999` hold a turn open until the wall clock. A task whose output
  * stops growing still lets the silence clock run out, and that ends the turn
  * exactly as before.
+ *
+ * Whoever started it: the main assistant, or a helper (`owned_by_subagent`). A
+ * helper's command holds the turn open exactly like the main assistant's, so
+ * its progress has to count the same way; leaving it out let a helper's long
+ * build be stopped as silent while it was printing all along (D09379).
+ *
+ * Which commands run in the background is read from the same reply, not from
+ * `is_backgrounded`: a command the model ran in the foreground is moved to the
+ * background when it outlives its tool timeout, and its `task_started` was
+ * written before that happened. Only a command running in the background gets
+ * a reply naming an output file, so a foreground one is never watched.
  *
  * The path is read from the CLI's own reply to the call ("Output is being
  * written to: …"), never built here: the `/tmp/claude-<uid>/…/tasks/` layout
@@ -44,7 +55,7 @@ interface Watched {
 }
 
 export interface TaskOutputWatch {
-  /** A task started. Only main-assistant backgrounded `local_bash` tasks are kept. */
+  /** A task started. Every `local_bash` task is kept until its reply says whether it runs in the background. */
   started(frame: Record<string, unknown>): void;
   /** A tool result arrived; if it answers a kept task's call, start watching its file. */
   toolResult(toolUseId: string, text: string): void;
@@ -117,7 +128,6 @@ export function createTaskOutputWatch(opts: {
   return {
     started: (frame) => {
       if (!enabled || stopped) return;
-      if (frame['is_backgrounded'] !== true || frame['owned_by_subagent'] === true) return;
       if (frame['task_type'] !== 'local_bash') return;
       const taskId = frame['task_id'];
       const toolUseId = frame['tool_use_id'];
@@ -130,7 +140,7 @@ export function createTaskOutputWatch(opts: {
       awaitingPath.delete(toolUseId);
       const path = outputPathFrom(text);
       if (path === null) {
-        opts.log.debug('Background task reply names no output file — not watching it', {
+        opts.log.debug('Task reply names no output file (it ran in the foreground) — not watching it', {
           requestId: opts.requestId, taskId,
         });
 

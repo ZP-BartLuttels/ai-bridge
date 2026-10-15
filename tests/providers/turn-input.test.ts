@@ -198,6 +198,155 @@ describe('messages for a running turn', () => {
     expect(of(turn.events, 'done')).toHaveLength(1);
   });
 
+  describe('commands a finished helper left behind', () => {
+    /** A shell command a helper started: the CLI marks it `owned_by_subagent`. */
+    const helperCommand = (id: string): Step => line({
+      type: 'system', subtype: 'task_started', task_id: id, tool_use_id: `toolu_${id}`,
+      task_type: 'local_bash', is_backgrounded: true, owned_by_subagent: true, description: id,
+    });
+    /** What the CLI writes for such a command once stdin is closed (captured, 2.1.280). */
+    const killedOnClose = (id: string): Step[] => [
+      line({ type: 'system', subtype: 'task_updated', task_id: id, patch: { status: 'killed' } }),
+      line({ type: 'system', subtype: 'task_notification', task_id: id, tool_use_id: `toolu_${id}`, status: 'stopped' }),
+    ];
+
+    it('still hold the turn open after the helper finished: the CLI wakes it with their result', async () => {
+      // A finished helper is not gone. When its background command ends, the
+      // CLI hands it the notification and it carries on (2.1.283, 2026-10-15:
+      // a helper woken four times this way to read its test runs and merge).
+      // Closing stdin early would make the CLI kill the command mid-run.
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('a1', 'local_agent', true),
+          text('Launched.'), result(),
+          helperCommand('b1'),
+          taskFinished('a1'),
+          init, text('The helper is waiting on its check.'), result({ origin: { kind: 'task-notification' } }),
+          { sleep: 300 },
+          taskFinished('b1'),
+          { waitEof: true },
+        ],
+      });
+
+      // Lines: echo, init, helper, text, result (5) | command (6) | helper
+      // ends (7) | init, text, result (10) | command ends (11). Not before.
+      expect(turn.record.eofAt).toBe(11);
+      expect(of(turn.events, 'input_closed').map((e) => e.data)).toEqual([{ reason: 'idle' }]);
+      expect(of(turn.events, 'error')).toEqual([]);
+    });
+
+    it('end the turn gently, not as an error, when only they are left and the bound runs out', async () => {
+      // The incident: a "wait until ready" loop that would never end, printing
+      // nothing, left by a finished helper after the answer was complete.
+      const turn = await runInputTurn({
+        message: 'go',
+        silenceTimeoutSeconds: 1,
+        steps: [
+          echo('go'), init,
+          taskStarted('a1', 'local_agent', true),
+          text('Launched.'), result(),
+          helperCommand('b1'),
+          taskFinished('a1'),
+          init, text('The review is done.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+          ...killedOnClose('b1'),
+        ],
+      });
+
+      expect(turn.record.eofAt).toBe(10);
+      expect(of(turn.events, 'input_closed').map((e) => e.data))
+        .toEqual([{ reason: 'leftovers_silent', stopped_tasks: 1 }]);
+      expect(of(turn.events, 'error')).toEqual([]);
+      expect(of(turn.events, 'done')).toHaveLength(1);
+    });
+
+    it('are stopped as silent, as before, when the main assistant\'s own command is running too', async () => {
+      const turn = await runInputTurn({
+        message: 'go',
+        silenceTimeoutSeconds: 1,
+        steps: [
+          echo('go'), init,
+          taskStarted('m1', 'local_bash', true),
+          taskStarted('a1', 'local_agent', true),
+          text('Launched.'), result(),
+          helperCommand('b1'),
+          taskFinished('a1'),
+          init, text('Waiting.'), result({ origin: { kind: 'task-notification' } }),
+          { sleep: 5000 },
+        ],
+      });
+
+      expect(of(turn.events, 'input_closed')).toEqual([]);
+      expect(of(turn.events, 'error')[0].data).toMatchObject({ code: 'silence_timeout_exceeded' });
+    });
+
+    it('still hold it while the helper that started them is at work', async () => {
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('a1', 'local_agent', true),
+          text('Launched.'), result(),
+          helperCommand('b1'), { sleep: 150 },
+          // Nothing may have closed stdin yet: the helper still works.
+          taskFinished('b1'), taskFinished('a1'),
+          init, text('The review is done.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+        ],
+      });
+
+      // Closed only after the helper ended (line 8) and its answer (line 11).
+      expect(turn.record.eofAt).toBe(11);
+      expect(of(turn.events, 'done')).toHaveLength(1);
+    });
+
+    it('change nothing for a command the main assistant left running', async () => {
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('b1', 'local_bash', true),
+          text('Started.'), result(), { sleep: 150 },
+          taskFinished('b1'), { sleep: 150 },
+          init, text('It printed done.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+        ],
+      });
+
+      // As in 'keeps stdin open for a local_bash task': not before its end.
+      expect(turn.record.eofAt).toBeGreaterThanOrEqual(8);
+    });
+
+    it('wait for the main assistant\'s answer to its own command moved to the background late', async () => {
+      // Started in the foreground (no is_backgrounded), moved to the background
+      // when it outlived its tool timeout. The reply says so; the CLI then owes
+      // the main assistant a turn with the result, and the close must wait it.
+      const turn = await runInputTurn({
+        message: 'go',
+        steps: [
+          echo('go'), init,
+          taskStarted('m1', 'local_bash', false),
+          line({ type: 'user', message: { role: 'user', content: [{
+            type: 'tool_result', tool_use_id: 'toolu_m1',
+            content: 'Command did not complete within its 120s timeout and was moved to the background (ID: m1). '
+              + 'Output is being written to: /tmp/does-not-exist/m1.output. You will be notified when it completes.',
+          }] } }),
+          text('It is still running in the background.'), result(),
+          taskFinished('m1'), { sleep: 300 },
+          init, text('The build finished.'), result({ origin: { kind: 'task-notification' } }),
+          { waitEof: true },
+        ],
+      });
+
+      // Lines: echo, init, task, reply, text, result (6) | ends (7) | init,
+      // text, result (10). Closing at 7 would drop the answer to the result.
+      expect(turn.record.eofAt).toBe(10);
+      expect(of(turn.events, 'error')).toEqual([]);
+    });
+  });
+
   it('does not close stdin while an accepted message is still unread, then closes when drained', async () => {
     let offered = false;
     const turn = await runInputTurn({

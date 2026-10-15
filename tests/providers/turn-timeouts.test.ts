@@ -127,3 +127,32 @@ describe('the clock that measures silence', () => {
     expect(onFire).not.toHaveBeenCalled();
   });
 });
+
+describe('a gentle end before the silence bound fires', () => {
+  it('does not fire when onSilence ended the turn, and fires at the next run-out if it did not end', () => {
+    vi.useFakeTimers();
+    const onFire = vi.fn();
+    const onSilence = vi.fn(() => true);
+    const timeouts = startTurnTimeouts({ silenceSeconds: 10, requestSeconds: 0, onFire, onSilence });
+
+    vi.advanceTimersByTime(10_000);
+    expect(onSilence).toHaveBeenCalledTimes(1);
+    expect(onFire).not.toHaveBeenCalled();
+    expect(timeouts.reason()).toBeNull();
+
+    // The CLI did not exit after the gentle end: the bound still stops it,
+    // without asking again.
+    vi.advanceTimersByTime(10_000);
+    expect(onSilence).toHaveBeenCalledTimes(1);
+    expect(onFire).toHaveBeenCalledWith('silence_timeout_exceeded', 10);
+  });
+
+  it('fires at once when onSilence declines', () => {
+    vi.useFakeTimers();
+    const onFire = vi.fn();
+    startTurnTimeouts({ silenceSeconds: 10, requestSeconds: 0, onFire, onSilence: () => false });
+
+    vi.advanceTimersByTime(10_000);
+    expect(onFire).toHaveBeenCalledWith('silence_timeout_exceeded', 10);
+  });
+});
