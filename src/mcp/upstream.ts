@@ -247,6 +247,15 @@ export function parseUpstreamConfig(doc: unknown): Record<string, UpstreamConfig
       throw new Error(`${where}: needs "command" (stdio) or "url" (Streamable HTTP)`);
     }
   }
+  // OAuth tokens are kept per url: two upstreams on one url would rotate each other's refresh token away.
+  const seen = new Map<string, string>();
+  for (const [name, cfg] of Object.entries(out)) {
+    if (!('url' in cfg) || cfg.auth !== 'oauth') continue;
+    const key = new URL(cfg.url).href;
+    const other = seen.get(key);
+    if (other) throw new Error(`MCP upstream "${name}": same url as "${other}"; one OAuth upstream per url`);
+    seen.set(key, name);
+  }
   return out;
 }
 

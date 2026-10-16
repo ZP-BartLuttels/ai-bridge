@@ -25,6 +25,8 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import {
   discoverOAuthServerInfo, exchangeAuthorization, extractWWWAuthenticateParams, refreshAuthorization,
   registerClient, selectResourceURL, startAuthorization,
@@ -45,6 +47,10 @@ export const SIGN_IN_TTL_MS = 10 * 60_000;
 /** Refresh this long before the access token expires. */
 const REFRESH_MARGIN_MS = 60_000;
 const DEFAULT_CLIENT_NAME = 'AI Bridge';
+/** Every request to an authorization server or for metadata (not MCP traffic) gives up after this. */
+export const OAUTH_FETCH_TIMEOUT_MS = 15_000;
+/** The largest metadata, registration or token response read. */
+export const OAUTH_MAX_RESPONSE_BYTES = 1024 * 1024;
 
 /** Why a person is asked to sign in (`upstream_auth_required.reason`). */
 export type AuthRequiredReason = 'no_token' | 'refresh_failed' | 'rejected' | 'requested';
@@ -90,8 +96,10 @@ export interface StoredTokens {
   /** Epoch ms; absent when the server gave no expires_in. */
   expires_at?: number;
   scope?: string;
-  /** The redirect the issuing client was registered with: a refresh uses that client. */
+  /** The redirect the issuing client was registered with. */
   redirect_uri?: string;
+  /** The client registration that issued these tokens: a refresh uses exactly this client. */
+  client?: OAuthClientInformationFull;
 }
 
 interface StoredClient {
@@ -160,6 +168,10 @@ interface Pending {
   redirectUri: string;
   client: OAuthClientInformationFull;
   expiresAt: number;
+  /** The authorization server the link points at: the code is exchanged there, whatever is discovered later. */
+  discovered: Discovered;
+  /** forget() generation when the link was made. */
+  generation: number;
 }
 
 interface Discovered {
@@ -194,6 +206,43 @@ function sameString(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
+/** Loopback, private, link-local, CGNAT, unspecified, or unique-local / link-local IPv6. */
+export function isInternalAddress(ip: string): boolean {
+  const v = isIP(ip);
+  if (v === 4) {
+    const [a, b] = ip.split('.').map(Number) as [number, number];
+    return a === 127 || a === 10 || a === 0 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127);
+  }
+  if (v === 6) {
+    const x = ip.toLowerCase();
+    if (x === '::1' || x === '::') return true;
+    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(x);
+    if (mapped) return isInternalAddress(mapped[1]!);
+    return /^f[cd]/.test(x) || /^fe[89ab]/.test(x);
+  }
+  return false;
+}
+
+function hostOf(u: URL): string {
+  return u.hostname.replace(/^\[|\]$/g, '');
+}
+
+function isLoopbackHost(host: string): boolean {
+  return host === 'localhost' || host.endsWith('.localhost') || (isIP(host) !== 0 && isInternalAddress(host) && (host.startsWith('127.') || host === '::1'));
+}
+
+async function resolvesInternal(host: string): Promise<boolean> {
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (isIP(host)) return isInternalAddress(host);
+  try {
+    const addrs = await lookup(host, { all: true });
+    return addrs.some((a) => isInternalAddress(a.address));
+  } catch {
+    return false; // the fetch itself will fail to resolve it
+  }
+}
+
 function isoSeconds(ms: number): string {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
@@ -204,7 +253,17 @@ export class UpstreamOAuth {
   private discovered: Discovered | null = null;
   private resourceMetadataUrl: URL | undefined;
   private refreshing: Promise<StoredTokens> | null = null;
+  /** begin() calls run one after another: two at once would each register a client. */
+  private beginChain: Promise<unknown> = Promise.resolve();
+  /** Bumped by forget(): a refresh or exchange that started before it does not save. */
+  private generation = 0;
+  /** MCP traffic to the upstream: no timeout (it carries long-lived streams). */
   private readonly base: FetchLike;
+  /** Everything else (metadata, registration, token endpoint): timed, size-capped, guarded. */
+  private readonly oauthFetch: FetchLike;
+  private readonly timeoutMs: number;
+  /** Whether the upstream itself is on an internal address: then so may its authorization server be. */
+  private upstreamInternal: Promise<boolean> | null = null;
 
   constructor(
     readonly server: string,
@@ -212,8 +271,66 @@ export class UpstreamOAuth {
     private readonly options: OAuthOptions,
     private readonly store: OAuthStore,
     fetchFn?: FetchLike,
+    limits: { timeoutMs?: number } = {},
   ) {
     this.base = fetchFn ?? ((input, init) => fetch(input, init));
+    this.timeoutMs = limits.timeoutMs ?? OAUTH_FETCH_TIMEOUT_MS;
+    this.oauthFetch = (input, init) => this.guardedFetch(input, init);
+  }
+
+  /**
+   * A request for metadata or to the authorization server. These URLs come
+   * from documents the upstream serves, so they are checked before they are
+   * fetched: https only (plain http to loopback is allowed), and no internal
+   * address unless the upstream itself is on one. Never follows a redirect by
+   * itself (the SDK follows same-origin ones through here again). Gives up
+   * after the timeout; reads at most 1 MB.
+   */
+  private async guardedFetch(input: string | URL, init?: RequestInit): Promise<Response> {
+    const target = new URL(typeof input === 'string' ? input : input.href);
+    const host = hostOf(target);
+    if (target.protocol !== 'https:' && !(target.protocol === 'http:' && isLoopbackHost(host))) {
+      throw new Error(`refusing ${target.protocol}// for ${target.origin}: OAuth endpoints must be https`);
+    }
+    if (await resolvesInternal(host)) {
+      this.upstreamInternal ??= resolvesInternal(hostOf(new URL(this.url)));
+      if (!(await this.upstreamInternal)) throw new Error(`refusing ${target.origin}: an internal address, and the upstream is not on one`);
+    }
+    const timeout = AbortSignal.timeout(this.timeoutMs);
+    const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout;
+    let res: Response;
+    try {
+      res = await this.base(target, { ...init, redirect: 'manual', signal });
+    } catch (err) {
+      if (timeout.aborted) throw new Error(`${target.origin} did not answer within ${this.timeoutMs} ms`);
+      throw err;
+    }
+    const declared = Number(res.headers.get('content-length') ?? '0');
+    if (declared > OAUTH_MAX_RESPONSE_BYTES) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`${target.origin} answered with more than ${OAUTH_MAX_RESPONSE_BYTES} bytes`);
+    }
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+      if (res.body) {
+        for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+          size += chunk.byteLength;
+          if (size > OAUTH_MAX_RESPONSE_BYTES) {
+            await res.body.cancel().catch(() => undefined);
+            throw new Error(`${target.origin} answered with more than ${OAUTH_MAX_RESPONSE_BYTES} bytes`);
+          }
+          chunks.push(chunk);
+        }
+      }
+    } catch (err) {
+      if (timeout.aborted) throw new Error(`${target.origin} did not answer within ${this.timeoutMs} ms`);
+      throw err;
+    }
+    const nullBody = res.status === 204 || res.status === 304 || (res.status >= 300 && res.status < 400 && size === 0);
+    const out = new Response(nullBody ? null : Buffer.concat(chunks), { status: res.status, statusText: res.statusText, headers: res.headers });
+    Object.defineProperty(out, 'url', { value: res.url || target.href });
+    return out;
   }
 
   private current(): StoredTokens | null {
@@ -235,19 +352,22 @@ export class UpstreamOAuth {
       if (t.refresh_token) out.push({ name: `${this.server}.refresh_token`, value: t.refresh_token });
     }
     if (this.pending) out.push({ name: `${this.server}.code_verifier`, value: this.pending.verifier });
-    const secret = this.pending?.client.client_secret;
+    const secret = this.pending?.client.client_secret ?? t?.client?.client_secret;
     if (secret) out.push({ name: `${this.server}.client_secret`, value: secret });
     return out;
   }
 
   /** Forget the tokens, here and on disk. The client registration stays. */
   forget(): void {
+    this.generation += 1;
     this.tokens = null;
     this.pending = null;
     this.store.deleteTokens(this.url);
   }
 
-  private save(tokens: OAuthTokens, previous: StoredTokens | null, redirectUri?: string): StoredTokens {
+  private save(tokens: OAuthTokens, previous: StoredTokens | null, generation: number, issuedBy?: { redirectUri: string; client: OAuthClientInformationFull }): StoredTokens {
+    // Signed out while this was under way: what it brought back is not kept.
+    if (generation !== this.generation) throw new Error('signed out while the token request was under way');
     const stored: StoredTokens = {
       url: this.url,
       access_token: tokens.access_token,
@@ -256,14 +376,20 @@ export class UpstreamOAuth {
       ...(tokens.refresh_token ?? previous?.refresh_token ? { refresh_token: tokens.refresh_token ?? previous!.refresh_token! } : {}),
       ...(typeof tokens.expires_in === 'number' ? { expires_at: Date.now() + tokens.expires_in * 1000 } : {}),
       ...(tokens.scope ? { scope: tokens.scope } : {}),
-      ...(redirectUri ?? previous?.redirect_uri ? { redirect_uri: redirectUri ?? previous!.redirect_uri! } : {}),
+      ...(issuedBy?.redirectUri ?? previous?.redirect_uri ? { redirect_uri: issuedBy?.redirectUri ?? previous!.redirect_uri! } : {}),
+      ...(issuedBy?.client ?? previous?.client ? { client: issuedBy?.client ?? previous!.client! } : {}),
     };
     this.store.writeTokens(stored);
     this.tokens = stored;
     return stored;
   }
 
-  private drop(deleteFile: boolean): void {
+  /**
+   * Give up on `t`, but only while it is still the current token: a request
+   * that went out with an older one must not wipe what a refresh brought since.
+   */
+  private dropIfCurrent(t: StoredTokens, deleteFile: boolean): void {
+    if (this.current()?.access_token !== t.access_token) return;
     this.tokens = null;
     if (deleteFile) this.store.deleteTokens(this.url);
   }
@@ -286,39 +412,49 @@ export class UpstreamOAuth {
     if (!t) return null;
     if (t.expires_at === undefined || t.expires_at - Date.now() > REFRESH_MARGIN_MS) return t;
     if (!t.refresh_token) {
-      this.drop(true);
+      if (t.expires_at > Date.now()) return t; // nothing to refresh with; good until it expires
+      this.dropIfCurrent(t, true);
       return null;
     }
     try {
       return await this.refresh(t);
     } catch (err) {
+      // An early refresh that failed for want of an answer: the token is still good until it expires.
+      if (!(err instanceof OAuthError) && t.expires_at > Date.now() && this.current()?.access_token === t.access_token) return t;
+      this.dropIfCurrent(t, err instanceof OAuthError);
       throw new NeedsAuthError('refresh_failed', `refreshing the token failed: ${message(err)}`);
     }
   }
 
   /** Refresh once; concurrent callers share the one attempt. */
+  /**
+   * Refresh `t` once; concurrent callers share the one attempt. When `t` is no
+   * longer the current token (another request refreshed it meanwhile), the
+   * current one is the answer: its refresh token was rotated away. Throws on
+   * failure and drops nothing: the caller decides (see dropIfCurrent).
+   */
   private refresh(t: StoredTokens): Promise<StoredTokens> {
+    const now = this.current();
+    // Signed out or given up meanwhile: an old refresh token must not bring it back.
+    if (!now) return Promise.reject(new Error('there is no token to refresh any more'));
+    if (now.access_token !== t.access_token) return Promise.resolve(now);
     if (!this.refreshing) {
+      const generation = this.generation;
       this.refreshing = (async () => {
         try {
           const d = await this.discover();
-          const client = this.anyClient();
+          const client = t.client ?? this.clientFromStore(t);
           if (!client) throw new Error('no client registration to refresh with');
           const tokens = await refreshAuthorization(d.info.authorizationServerUrl, {
             metadata: d.info.authorizationServerMetadata,
             clientInformation: client,
             refreshToken: t.refresh_token!,
             ...(d.resource ? { resource: d.resource } : {}),
-            fetchFn: this.base,
+            fetchFn: this.oauthFetch,
           });
+          const saved = this.save(tokens, t, generation);
           log.info('upstream token refreshed', { name: this.server });
-          return this.save(tokens, t);
-        } catch (err) {
-          // An answer from the authorization server (invalid_grant, ...) means
-          // the refresh token is dead; a network failure does not, so the file
-          // stays for the next start. Either way this process asks to sign in.
-          this.drop(err instanceof OAuthError);
-          throw err;
+          return saved;
         } finally {
           this.refreshing = null;
         }
@@ -327,10 +463,9 @@ export class UpstreamOAuth {
     return this.refreshing;
   }
 
-  /** The client the current tokens were issued to (registered for the redirect they came back through). */
-  private anyClient(): OAuthClientInformationFull | null {
-    const redirect = this.current()?.redirect_uri;
-    return redirect ? this.store.readClient(this.url, redirect) : null;
+  /** Tokens written before the client was stored with them: the registration for their redirect. */
+  private clientFromStore(t: StoredTokens): OAuthClientInformationFull | null {
+    return t.redirect_uri ? this.store.readClient(this.url, t.redirect_uri) : null;
   }
 
   /** For StreamableHTTPClientTransport's `fetch` option. */
@@ -351,20 +486,22 @@ export class UpstreamOAuth {
     if (res.status !== 401) return res;
     this.noteChallenge(res);
     await res.body?.cancel().catch(() => undefined);
-    if (!t.refresh_token) {
-      this.drop(true);
+    const latest = this.current();
+    if (!t.refresh_token && latest?.access_token === t.access_token) {
+      this.dropIfCurrent(t, true);
       throw new NeedsAuthError('rejected', `${this.server} rejected the token`);
     }
     let fresh: StoredTokens;
     try {
       fresh = await this.refresh(t);
     } catch (err) {
+      this.dropIfCurrent(t, err instanceof OAuthError);
       throw new NeedsAuthError('refresh_failed', `refreshing the token failed: ${message(err)}`);
     }
     const again = await this.base(input, withBearer(init, fresh.access_token));
     if (again.status === 401) {
       await again.body?.cancel().catch(() => undefined);
-      this.drop(true);
+      this.dropIfCurrent(fresh, true);
       throw new NeedsAuthError('rejected', `${this.server} rejected a freshly refreshed token`);
     }
     return again;
@@ -376,7 +513,7 @@ export class UpstreamOAuth {
 
   /** Ask the upstream, without a token, where its metadata is. */
   private async probe(): Promise<void> {
-    const res = await this.base(this.url, {
+    const res = await this.oauthFetch(this.url, {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'ai-bridge', version: '0' } } }),
@@ -390,7 +527,7 @@ export class UpstreamOAuth {
     if (!this.resourceMetadataUrl) await this.probe();
     const info = await discoverOAuthServerInfo(this.url, {
       ...(this.resourceMetadataUrl ? { resourceMetadataUrl: this.resourceMetadataUrl } : {}),
-      fetchFn: this.base,
+      fetchFn: this.oauthFetch,
     });
     if (!info.authorizationServerMetadata) throw new Error(`no authorization server metadata at ${info.authorizationServerUrl}`);
     // Only selectResourceURL's default validation is wanted, which needs no provider methods.
@@ -404,7 +541,13 @@ export class UpstreamOAuth {
    * Discovery, registration when there is none for this redirect, and a fresh
    * link. A new link replaces the pending one: its state stops working.
    */
-  async begin(redirectUri: string): Promise<SignInLink> {
+  begin(redirectUri: string): Promise<SignInLink> {
+    const run = this.beginChain.then(() => this.beginNow(redirectUri));
+    this.beginChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async beginNow(redirectUri: string): Promise<SignInLink> {
     let d: Discovered;
     try {
       d = await this.discover();
@@ -424,7 +567,7 @@ export class UpstreamOAuth {
             client_name: this.options.client_name ?? DEFAULT_CLIENT_NAME,
           },
           ...(d.scope ? { scope: d.scope } : {}),
-          fetchFn: this.base,
+          fetchFn: this.oauthFetch,
         });
       } catch (err) {
         throw new OAuthFlowError('registration_failed', `client registration failed: ${message(err)}`);
@@ -448,7 +591,7 @@ export class UpstreamOAuth {
       throw new OAuthFlowError('discovery_failed', message(err));
     }
     const expiresAt = Date.now() + SIGN_IN_TTL_MS;
-    this.pending = { state, verifier: started.codeVerifier, redirectUri, client, expiresAt };
+    this.pending = { state, verifier: started.codeVerifier, redirectUri, client, expiresAt, discovered: d, generation: this.generation };
     return { state, authorization_url: started.authorizationUrl.href, expires_at: isoSeconds(expiresAt) };
   }
 
@@ -471,9 +614,7 @@ export class UpstreamOAuth {
       if (params.error === 'access_denied') throw new OAuthFlowError('denied', `The sign-in was refused${detail}`);
       throw new OAuthFlowError('exchange_failed', `The authorization server answered ${params.error}${detail}`);
     }
-    const d = this.discovered ?? await this.discover().catch((err: unknown) => {
-      throw new OAuthFlowError('discovery_failed', `discovery failed: ${message(err)}`);
-    });
+    const d = p.discovered;
     const meta = d.info.authorizationServerMetadata;
     // RFC 9207: checked when the metadata says the server sends it, and
     // whenever it is present (a wrong issuer is never right).
@@ -492,12 +633,16 @@ export class UpstreamOAuth {
         codeVerifier: p.verifier,
         redirectUri: p.redirectUri,
         ...(d.resource ? { resource: d.resource } : {}),
-        fetchFn: this.base,
+        fetchFn: this.oauthFetch,
       });
     } catch (err) {
       throw new OAuthFlowError('exchange_failed', `exchanging the code failed: ${message(err)}`);
     }
-    this.save(tokens, null, p.redirectUri);
+    try {
+      this.save(tokens, null, p.generation, { redirectUri: p.redirectUri, client: p.client });
+    } catch (err) {
+      throw new OAuthFlowError('unknown_state', `${message(err)}; sign in again`);
+    }
     log.info('upstream signed in', { name: this.server });
   }
 }
