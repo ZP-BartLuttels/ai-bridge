@@ -39,6 +39,10 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { ErrorCode, McpError, ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ToolDefinition } from '../protocol/types.js';
 import { scrub, type Redaction } from '../local/scrub.js';
+import {
+  NeedsAuthError, OAuthFlowError, OAuthStore, UpstreamOAuth,
+  type AuthRequiredReason, type AuthResultCode, type OAuthOptions, type RedirectParams,
+} from './oauth.js';
 import { createLogger } from '../utils/logger.js';
 
 const log = createLogger('mcp-upstream');
@@ -80,7 +84,7 @@ interface UpstreamCommon {
 
 export type UpstreamConfig =
   | ({ command: string; args?: string[]; env?: Record<string, ConfigValue>; cwd?: string } & UpstreamCommon)
-  | ({ url: string; headers?: Record<string, ConfigValue> } & UpstreamCommon);
+  | ({ url: string; headers?: Record<string, ConfigValue>; auth?: 'oauth'; oauth?: OAuthOptions } & UpstreamCommon);
 
 /** Resolves a reference to its value. Throws when it cannot. */
 export type SecretResolver = (ref: SecretRef) => Promise<string>;
@@ -164,6 +168,19 @@ function checkTimeout(where: string, key: string, v: unknown): number | undefine
   return v;
 }
 
+function checkOAuth(where: string, v: unknown): OAuthOptions {
+  if (v === undefined) return {};
+  if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error(`${where}: oauth must be an object`);
+  const o = v as Record<string, unknown>;
+  const out: OAuthOptions = {};
+  for (const [k, val] of Object.entries(o)) {
+    if (k !== 'scope' && k !== 'client_name') throw new Error(`${where}: oauth takes only "scope" and "client_name", not "${k}"`);
+    if (typeof val !== 'string' || val.trim() === '') throw new Error(`${where}: oauth.${k} must be a non-empty string`);
+    out[k] = val;
+  }
+  return out;
+}
+
 /**
  * Validate an upstreams document. Accepts `{"mcpServers": {...}}` (the shape
  * Claude Code and Claude Desktop use) or the bare map. Throws, naming the
@@ -188,8 +205,11 @@ export function parseUpstreamConfig(doc: unknown): Record<string, UpstreamConfig
     const ct = checkTimeout(where, 'connect_timeout_ms', c['connect_timeout_ms']);
     if (ct !== undefined) common.connect_timeout_ms = ct;
 
+    if (c['auth'] !== undefined && c['auth'] !== 'oauth') throw new Error(`${where}: auth must be "oauth" or absent`);
+    if (c['oauth'] !== undefined && c['auth'] !== 'oauth') throw new Error(`${where}: "oauth" needs "auth": "oauth"`);
     if (typeof c['command'] === 'string' && c['command'].length > 0) {
       if (c['url'] !== undefined) throw new Error(`${where}: give "command" or "url", not both`);
+      if (c['auth'] !== undefined) throw new Error(`${where}: "auth": "oauth" needs "url" (an HTTP server), not "command"`);
       if (c['args'] !== undefined && (!Array.isArray(c['args']) || !c['args'].every((a) => typeof a === 'string'))) {
         throw new Error(`${where}: args must be an array of strings`);
       }
@@ -210,7 +230,19 @@ export function parseUpstreamConfig(doc: unknown): Record<string, UpstreamConfig
       if (url.username || url.password) throw new Error(`${where}: no credentials in the url; use headers with {"env"} or {"vault"}`);
       const headers: Record<string, ConfigValue> = {};
       for (const [k, v] of Object.entries((c['headers'] ?? {}) as Record<string, unknown>)) headers[k] = checkValue(where, 'header', k, v);
-      out[name] = { url: c['url'], ...(Object.keys(headers).length ? { headers } : {}), ...common };
+      let oauth: OAuthOptions | undefined;
+      if (c['auth'] === 'oauth') {
+        if (Object.keys(headers).some((h) => h.toLowerCase() === 'authorization')) {
+          throw new Error(`${where}: "auth": "oauth" and an Authorization header cannot both be given`);
+        }
+        oauth = checkOAuth(where, c['oauth']);
+      }
+      out[name] = {
+        url: c['url'],
+        ...(Object.keys(headers).length ? { headers } : {}),
+        ...(oauth ? { auth: 'oauth' as const, ...(Object.keys(oauth).length ? { oauth } : {}) } : {}),
+        ...common,
+      };
     } else {
       throw new Error(`${where}: needs "command" (stdio) or "url" (Streamable HTTP)`);
     }
@@ -292,12 +324,46 @@ interface Conn {
   failures: number;
   retryTimer: NodeJS.Timeout | null;
   lastError: string | null;
+  /** How the upstream is authenticated, for upstream_status. */
+  auth: 'none' | 'secrets' | 'oauth';
+  /** OAuth upstreams only. */
+  oauth: UpstreamOAuth | null;
+  /** Set while a person has to sign in; `error` is upstream_status.error. */
+  needsAuth: { reason: Exclude<AuthRequiredReason, 'requested'>; error: string } | null;
+  /** After upstream_auth_forget: no upstream_auth_required until upstream_auth_start. */
+  quiet: boolean;
+  /** The server connection (session number) this upstream last sent upstream_auth_required on. */
+  promptedIn: number;
 }
+
+/** One entry of `upstream_status`. */
+export interface UpstreamStatusEntry {
+  server: string;
+  transport: 'http' | 'stdio';
+  /** http: scheme + host + port only. stdio: null. */
+  origin: string | null;
+  auth: 'none' | 'secrets' | 'oauth';
+  state: 'connecting' | 'connected' | 'needs_auth' | 'unavailable';
+  tools: number;
+  error: string | null;
+}
+
+/** The upstream sign-in frames the bridge sends (PROTOCOL.md, "Upstream sign-in (OAuth)"). */
+export type UpstreamAuthFrame =
+  | { type: 'upstream_auth_required'; server: string; state: string; authorization_url: string; expires_at: string; reason: AuthRequiredReason }
+  | { type: 'upstream_auth_result'; server: string; state: string | null; ok: true }
+  | { type: 'upstream_auth_result'; server: string; state: string | null; ok: false; code: AuthResultCode; error: string };
 
 export interface UpstreamHubOptions {
   resolveSecret?: SecretResolver;
   /** Called when the set of tools the model may see changed. */
   onToolsChanged?: () => void;
+  /** Where OAuth registrations and tokens are kept (`<AI_BRIDGE_DATA_DIR>/mcp-oauth`). Needed for an `auth: "oauth"` upstream. */
+  oauthDir?: string;
+  /** An upstream's state, auth or tool count changed: send upstream_status. */
+  onStatusChanged?: () => void;
+  /** Send an upstream sign-in frame to the server. */
+  sendAuthFrame?: (frame: UpstreamAuthFrame) => void;
   /** Tests: a transport of your own per server. */
   transportFor?: (name: string, cfg: UpstreamConfig, resolved: { env?: Record<string, string>; headers?: Record<string, string> }) => import('@modelcontextprotocol/sdk/shared/transport.js').Transport;
 }
@@ -307,6 +373,12 @@ export class UpstreamHub {
   private readonly pendingUi = new Map<string, CallUi>();
   private closed = false;
   private readonly resolveSecret: SecretResolver;
+  /** Counts server connections (welcomes); 0 while none is up. */
+  private session = 0;
+  private serverUp = false;
+  /** welcome.upstream_oauth.redirect_uri of the current server connection. */
+  private redirectUri: string | null = null;
+  private lastStatus: string | null = null;
 
   constructor(config: Record<string, UpstreamConfig>, private readonly options: UpstreamHubOptions = {}) {
     this.resolveSecret = options.resolveSecret ?? envResolver;
@@ -315,9 +387,17 @@ export class UpstreamHub {
         log.warn('upstream name refused', { name });
         continue;
       }
+      let oauth: UpstreamOAuth | null = null;
+      if ('url' in cfg && cfg.auth === 'oauth') {
+        if (!options.oauthDir) throw new Error(`MCP upstream "${name}": an OAuth upstream needs a data directory`);
+        oauth = new UpstreamOAuth(name, cfg.url, cfg.oauth ?? {}, new OAuthStore(options.oauthDir));
+      }
+      const refs = Object.values(('url' in cfg ? cfg.headers : cfg.env) ?? {}).some((v) => typeof v !== 'string');
       this.conns.set(name, {
         name, cfg, client: null, connecting: null, tools: [], resourceUi: null,
         secrets: [], failures: 0, retryTimer: null, lastError: null,
+        auth: oauth ? 'oauth' : refs ? 'secrets' : 'none',
+        oauth, needsAuth: null, quiet: false, promptedIn: 0,
       });
     }
   }
@@ -327,10 +407,15 @@ export class UpstreamHub {
   }
 
   /** Which servers are connected right now, for logging and tests. */
-  status(): Record<string, { connected: boolean; tools: number; last_error: string | null }> {
-    const out: Record<string, { connected: boolean; tools: number; last_error: string | null }> = {};
-    for (const c of this.conns.values()) out[c.name] = { connected: c.client !== null, tools: c.tools.length, last_error: c.lastError };
+  status(): Record<string, { connected: boolean; tools: number; last_error: string | null; state: UpstreamStatusEntry['state'] }> {
+    const out: Record<string, { connected: boolean; tools: number; last_error: string | null; state: UpstreamStatusEntry['state'] }> = {};
+    for (const c of this.conns.values()) out[c.name] = { connected: c.client !== null, tools: c.tools.length, last_error: c.lastError, state: this.stateOf(c) };
     return out;
+  }
+
+  /** Resolved values plus every OAuth token: what is redacted from anything going out. */
+  private secretsOf(c: Conn): Redaction[] {
+    return c.oauth ? [...c.secrets, ...c.oauth.secrets()] : c.secrets;
   }
 
   /**
@@ -369,16 +454,22 @@ export class UpstreamHub {
   private ensure(c: Conn): Promise<Client> {
     if (this.closed) return Promise.reject(new UpstreamError('unavailable', 'the bridge is shutting down'));
     if (c.client) return Promise.resolve(c.client);
+    if (c.needsAuth) return Promise.reject(new UpstreamError('unavailable', this.signInText(c)));
     if (c.connecting) return c.connecting;
     if (c.retryTimer) { clearTimeout(c.retryTimer); c.retryTimer = null; }
     c.connecting = this.connect(c).then(
-      (client) => { c.connecting = null; return client; },
+      (client) => { c.connecting = null; this.statusMaybeChanged(); return client; },
       (err: unknown) => {
         c.connecting = null;
+        if (err instanceof NeedsAuthError) {
+          this.enterNeedsAuth(c, err.reason);
+          throw new UpstreamError('unavailable', this.signInText(c));
+        }
         c.failures += 1;
-        c.lastError = scrub(err instanceof Error ? err.message : String(err), c.secrets);
+        c.lastError = scrub(err instanceof Error ? err.message : String(err), this.secretsOf(c));
         log.warn('upstream MCP server unavailable', { name: c.name, error: c.lastError, attempt: c.failures });
         this.scheduleReconnect(c);
+        this.statusMaybeChanged();
         throw err instanceof UpstreamError ? new UpstreamError(err.code === 'timeout' ? 'unavailable' : err.code, `upstream ${c.name} is unavailable: ${c.lastError}`)
           : new UpstreamError('unavailable', `upstream ${c.name} is unavailable: ${c.lastError}`);
       },
@@ -387,7 +478,7 @@ export class UpstreamHub {
   }
 
   private scheduleReconnect(c: Conn): void {
-    if (this.closed || c.retryTimer) return;
+    if (this.closed || c.retryTimer || c.needsAuth) return;
     const wait = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** Math.max(0, c.failures - 1));
     c.retryTimer = setTimeout(() => {
       c.retryTimer = null;
@@ -405,7 +496,11 @@ export class UpstreamHub {
     if (this.options.transportFor) {
       transport = this.options.transportFor(c.name, c.cfg, resolved);
     } else if ('url' in c.cfg) {
-      transport = new StreamableHTTPClientTransport(new URL(c.cfg.url), resolved.headers ? { requestInit: { headers: resolved.headers } } : undefined);
+      transport = new StreamableHTTPClientTransport(new URL(c.cfg.url), {
+        ...(resolved.headers ? { requestInit: { headers: resolved.headers } } : {}),
+        // OAuth: the bearer token, refreshed before expiry or on a 401 (src/mcp/oauth.ts).
+        ...(c.oauth ? { fetch: c.oauth.fetch } : {}),
+      });
     } else {
       // Never the bridge's own environment: it holds AI_BRIDGE_TOKEN. Only the
       // SDK's safe defaults (HOME, PATH, ...) and what the config names.
@@ -417,7 +512,7 @@ export class UpstreamHub {
         stderr: 'pipe',
       });
       stdio.stderr?.on('data', (chunk: Buffer) => {
-        log.debug('upstream stderr', { name: c.name, text: scrub(chunk.toString('utf8').trimEnd(), c.secrets) });
+        log.debug('upstream stderr', { name: c.name, text: scrub(chunk.toString('utf8').trimEnd(), this.secretsOf(c)) });
       });
       transport = stdio;
     }
@@ -430,6 +525,7 @@ export class UpstreamHub {
       c.resourceUi = null;
       c.failures = 0;
       c.lastError = null;
+      c.needsAuth = null;
     } catch (err) {
       await client.close().catch(() => undefined);
       throw err;
@@ -439,6 +535,7 @@ export class UpstreamHub {
       try {
         c.tools = await this.listAllTools(client, c);
         this.options.onToolsChanged?.();
+        this.statusMaybeChanged();
       } catch (err) {
         log.warn('upstream tools/list after list_changed failed', { name: c.name, error: err instanceof Error ? err.message : String(err) });
       }
@@ -479,6 +576,7 @@ export class UpstreamHub {
     void client.close().catch(() => undefined);
     c.failures = Math.max(c.failures, 1);
     this.scheduleReconnect(c);
+    this.statusMaybeChanged();
   }
 
   /** Run one request on a server, with its timeout, mapping failures to codes. */
@@ -488,7 +586,11 @@ export class UpstreamHub {
     try {
       return await fn(client, timeout);
     } catch (err) {
-      const msg = scrub(err instanceof Error ? err.message : String(err), c.secrets);
+      if (err instanceof NeedsAuthError) {
+        this.enterNeedsAuth(c, err.reason);
+        throw new UpstreamError('unavailable', this.signInText(c));
+      }
+      const msg = scrub(err instanceof Error ? err.message : String(err), this.secretsOf(c));
       if (err instanceof McpError && err.code === ErrorCode.RequestTimeout) {
         throw new UpstreamError('timeout', `${what} on ${c.name} timed out after ${timeout} ms`);
       }
@@ -514,7 +616,28 @@ export class UpstreamHub {
   }
 
   private allTools(): UpstreamTool[] {
-    return [...this.conns.values()].flatMap((c) => c.tools);
+    return [...this.conns.values()].filter((c) => !c.needsAuth).flatMap((c) => c.tools);
+  }
+
+  /**
+   * For a call by name to a tool of an upstream that needs a sign-in (and so
+   * is not offered): what to tell the model. Null when that is not the case.
+   */
+  signInNeeded(qualified: string): string | null {
+    const i = qualified.indexOf(UPSTREAM_SEPARATOR);
+    if (i <= 0) return null;
+    const c = this.conns.get(qualified.slice(0, i));
+    return c?.needsAuth ? this.signInText(c) : null;
+  }
+
+  private signInText(c: Conn): string {
+    if (c.needsAuth?.error === 'no_redirect_uri') {
+      return `The MCP server "${c.name}" needs a sign-in, and this application cannot offer one (it gave the bridge no redirect address). Its tools cannot be used until the bridge operator fixes that.`;
+    }
+    if (c.quiet) {
+      return `The MCP server "${c.name}" was signed out on this bridge. The person can connect it again in the application; until then its tools cannot be used.`;
+    }
+    return `The MCP server "${c.name}" needs the person to sign in before its tools can be used. They have been asked to sign in; try again after they have.`;
   }
 
   owns(qualified: string): boolean {
@@ -531,7 +654,7 @@ export class UpstreamHub {
     if (!tool) throw new UpstreamError('refused', `no upstream tool ${qualified}`);
     const c = this.conns.get(tool.server)!;
     const raw = await this.run(c, `tools/call ${tool.name}`, (client, timeout) => client.callTool({ name: tool.name, arguments: args }, undefined, { timeout }));
-    const result = scrubDeep(raw, c.secrets) as {
+    const result = scrubDeep(raw, this.secretsOf(c)) as {
       content?: { type: string; text?: string }[]; isError?: boolean; structuredContent?: unknown; _meta?: unknown;
     };
     const uri = resourceUriOf(tool._meta);
@@ -564,12 +687,13 @@ export class UpstreamHub {
   async request(server: string, method: string, params: Record<string, unknown>): Promise<unknown> {
     const c = this.conns.get(server);
     if (!c) throw new UpstreamError('unknown_server', `no upstream server ${server}`);
+    if (c.needsAuth) throw new UpstreamError('unavailable', this.signInText(c));
     if (method === 'resources/read') {
       const uri = String(params['uri'] ?? '');
       if (!uri.startsWith('ui://')) throw new UpstreamError('refused', 'only ui:// resources are read for a view');
       const result = await this.run(c, 'resources/read', (client, timeout) => client.readResource({ uri }, { timeout }));
       await this.fillResourceUi(c, result as { contents?: Record<string, unknown>[] });
-      return scrubDeep(result, c.secrets);
+      return scrubDeep(result, this.secretsOf(c));
     }
     if (method === 'tools/call') {
       const name = String(params['name'] ?? '');
@@ -577,7 +701,7 @@ export class UpstreamHub {
       if (!tool) throw new UpstreamError('refused', `no tool ${name} on ${server}`);
       if (!visibility(tool._meta).includes('app')) throw new UpstreamError('refused', `${name} is not callable from a view`);
       const args = (params['arguments'] ?? {}) as Record<string, unknown>;
-      return scrubDeep(await this.run(c, `tools/call ${name}`, (client, timeout) => client.callTool({ name, arguments: args }, undefined, { timeout })), c.secrets);
+      return scrubDeep(await this.run(c, `tools/call ${name}`, (client, timeout) => client.callTool({ name, arguments: args }, undefined, { timeout })), this.secretsOf(c));
     }
     throw new UpstreamError('unsupported', `unsupported method ${method}`);
   }
@@ -607,6 +731,181 @@ export class UpstreamHub {
       const ui = c.resourceUi.get(String(item['uri']));
       if (ui) item['_meta'] = { ...((item['_meta'] as Record<string, unknown> | undefined) ?? {}), ui };
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Upstream sign-in (OAuth) and upstream_status
+  // -------------------------------------------------------------------------
+
+  private stateOf(c: Conn): UpstreamStatusEntry['state'] {
+    if (c.client) return 'connected';
+    if (c.needsAuth) return 'needs_auth';
+    if (c.connecting || (c.failures === 0 && c.lastError === null)) return 'connecting';
+    return 'unavailable';
+  }
+
+  /** The complete list, as upstream_status carries it. Never holds a secret. */
+  upstreamStatus(): UpstreamStatusEntry[] {
+    return [...this.conns.values()].map((c) => {
+      const state = this.stateOf(c);
+      const error = state === 'needs_auth' ? c.needsAuth!.error
+        : state === 'unavailable' ? scrub(c.lastError ?? 'unavailable', this.secretsOf(c)).slice(0, 300)
+        : null;
+      return {
+        server: c.name,
+        transport: 'url' in c.cfg ? 'http' as const : 'stdio' as const,
+        origin: 'url' in c.cfg ? new URL(c.cfg.url).origin : null,
+        auth: c.auth,
+        state,
+        tools: state === 'connected' ? c.tools.length : 0,
+        error,
+      };
+    });
+  }
+
+  /** Send upstream_status when the list differs from the last one sent on this server connection. */
+  private statusMaybeChanged(): void {
+    if (!this.serverUp || this.closed) return;
+    const now = JSON.stringify(this.upstreamStatus());
+    if (now === this.lastStatus) return;
+    this.lastStatus = now;
+    this.options.onStatusChanged?.();
+  }
+
+  /**
+   * A server connection completed its handshake. `redirectUri` is its
+   * welcome.upstream_oauth.redirect_uri, or null without one. Sends
+   * upstream_status, and asks for a sign-in for every OAuth upstream that
+   * needs one (once per server connection), unless it was signed out.
+   */
+  serverConnected(redirectUri: string | null): void {
+    this.session += 1;
+    this.serverUp = true;
+    this.redirectUri = redirectUri;
+    this.lastStatus = null;
+    for (const c of this.conns.values()) {
+      if (!c.oauth || !c.needsAuth) continue;
+      if (!redirectUri) c.needsAuth.error = 'no_redirect_uri';
+      else if (c.needsAuth.error === 'no_redirect_uri') c.needsAuth.error = c.needsAuth.reason;
+    }
+    this.statusMaybeChanged();
+    for (const c of this.conns.values()) {
+      if (c.oauth && c.needsAuth && !c.quiet) void this.prompt(c, c.needsAuth.reason);
+    }
+  }
+
+  /** The server connection went away. Pending sign-ins stay valid until they expire. */
+  serverDisconnected(): void {
+    this.serverUp = false;
+    this.lastStatus = null;
+  }
+
+  private enterNeedsAuth(c: Conn, reason: Exclude<AuthRequiredReason, 'requested'>): void {
+    const client = c.client;
+    c.client = null;
+    if (client) { client.onclose = undefined; void client.close().catch(() => undefined); }
+    if (c.retryTimer) { clearTimeout(c.retryTimer); c.retryTimer = null; }
+    const hadTools = c.tools.length > 0;
+    c.tools = [];
+    c.resourceUi = null;
+    c.failures = 0;
+    c.lastError = null;
+    const fresh = !c.needsAuth;
+    c.needsAuth = { reason, error: this.serverUp && !this.redirectUri ? 'no_redirect_uri' : reason };
+    log.info('upstream MCP server needs a sign-in', { name: c.name, reason });
+    if (hadTools) this.options.onToolsChanged?.();
+    this.statusMaybeChanged();
+    if (c.quiet) return;
+    // no_token: once per server connection. A failed refresh or a rejected
+    // token is news each time it happens.
+    if (reason !== 'no_token' || (fresh && c.promptedIn !== this.session)) void this.prompt(c, reason);
+  }
+
+  /** Make a sign-in link and send it. Failures go out as upstream_auth_result ok:false. */
+  private async prompt(c: Conn, reason: AuthRequiredReason): Promise<void> {
+    if (!this.serverUp || !c.oauth || this.closed) return;
+    const session = this.session;
+    if (!this.redirectUri) {
+      if (c.needsAuth) c.needsAuth.error = 'no_redirect_uri';
+      this.statusMaybeChanged();
+      if (reason === 'requested') this.authFailure(c.name, null, 'no_redirect_uri', 'This application gave the bridge no redirect address, so it cannot offer a sign-in.');
+      return;
+    }
+    c.promptedIn = session;
+    try {
+      const link = await c.oauth.begin(this.redirectUri);
+      if (session !== this.session || !this.serverUp) return; // that server connection is gone
+      this.options.sendAuthFrame?.({ type: 'upstream_auth_required', server: c.name, ...link, reason });
+    } catch (err) {
+      const code: AuthResultCode = err instanceof OAuthFlowError ? err.code : 'discovery_failed';
+      const text = scrub(err instanceof Error ? err.message : String(err), this.secretsOf(c));
+      log.warn('upstream sign-in could not be prepared', { name: c.name, code, error: text });
+      if (c.needsAuth) c.needsAuth.error = code;
+      this.statusMaybeChanged();
+      this.authFailure(c.name, null, code, text);
+    }
+  }
+
+  private authFailure(server: string, state: string | null, code: AuthResultCode, error: string): void {
+    this.options.sendAuthFrame?.({ type: 'upstream_auth_result', server, state, ok: false, code, error });
+  }
+
+  /** upstream_auth_start: the person asked to (re)connect. */
+  async authStart(server: string): Promise<void> {
+    const c = this.conns.get(server);
+    if (!c) return this.authFailure(server, null, 'unknown_server', `no upstream server ${server} on this bridge`);
+    if (!c.oauth) return this.authFailure(server, null, 'not_oauth', `upstream ${server} does not use OAuth`);
+    c.quiet = false;
+    await this.prompt(c, 'requested');
+  }
+
+  /** upstream_auth_code: the redirect came back through the web application. Answered exactly once. */
+  async authCode(server: string, state: unknown, params: RedirectParams): Promise<void> {
+    const st = typeof state === 'string' ? state : null;
+    const c = this.conns.get(server);
+    if (!c) return this.authFailure(server, st, 'unknown_server', `no upstream server ${server} on this bridge`);
+    if (!c.oauth) return this.authFailure(server, st, 'not_oauth', `upstream ${server} does not use OAuth`);
+    try {
+      await c.oauth.complete(st ?? '', params);
+    } catch (err) {
+      const code: AuthResultCode = err instanceof OAuthFlowError ? err.code : 'exchange_failed';
+      const text = scrub(err instanceof Error ? err.message : String(err), this.secretsOf(c));
+      log.info('upstream sign-in failed', { name: c.name, code, error: text });
+      // A stale link changes nothing; a refused or failed sign-in is the upstream's state now.
+      if (code !== 'unknown_state' && c.needsAuth) { c.needsAuth.error = code; this.statusMaybeChanged(); }
+      return this.authFailure(server, st, code, text);
+    }
+    this.options.sendAuthFrame?.({ type: 'upstream_auth_result', server, state: st, ok: true });
+    // Connect with the new token: lists the tools, tells the CLI (onToolsChanged), sends upstream_status.
+    const old = c.client;
+    c.client = null;
+    if (old) { old.onclose = undefined; await old.close().catch(() => undefined); }
+    c.needsAuth = null;
+    c.quiet = false;
+    // Signed in: a later loss of the token is news again on this server connection.
+    c.promptedIn = 0;
+    c.failures = 0;
+    c.lastError = null;
+    if (c.retryTimer) { clearTimeout(c.retryTimer); c.retryTimer = null; }
+    this.statusMaybeChanged();
+    await this.ensure(c).catch(() => undefined);
+  }
+
+  /** upstream_auth_forget: drop this upstream's tokens here. No sign-in is offered until upstream_auth_start. */
+  async authForget(server: string): Promise<void> {
+    const c = this.conns.get(server);
+    if (!c || !c.oauth) {
+      log.info('upstream_auth_forget for an unknown or non-OAuth upstream; ignored', { server });
+      return;
+    }
+    c.oauth.forget();
+    c.quiet = true;
+    const pending = c.connecting;
+    this.enterNeedsAuth(c, 'no_token');
+    await pending?.catch(() => undefined);
+    // A connect that was under way when the tokens went may have finished.
+    if (c.client) this.enterNeedsAuth(c, 'no_token');
+    log.info('upstream tokens forgotten', { name: c.name });
   }
 
   async close(): Promise<void> {
