@@ -420,3 +420,141 @@ describe('redaction', () => {
     expect(JSON.stringify(frames)).not.toContain(stored.refresh_token);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Review fixes (regressions)
+// ---------------------------------------------------------------------------
+
+import { UpstreamOAuth, NeedsAuthError } from '../../src/mcp/oauth.js';
+import type { FetchLike } from '@modelcontextprotocol/sdk/shared/transport.js';
+
+const INIT_BODY = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '0' } } });
+const post = (): RequestInit => ({ method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: INIT_BODY });
+
+/** An UpstreamOAuth on the fake, signed in, with a fetch the test can intercept. */
+async function direct(hook: (url: URL, init: RequestInit | undefined, next: FetchLike) => Promise<Response>, opts: { timeoutMs?: number } = {}) {
+  const store = new OAuthStore(join(dir, 'mcp-oauth'));
+  const base: FetchLike = (input, init) => hook(new URL(String(input)), init, (i, n) => fetch(i, n));
+  const o = new UpstreamOAuth('kz', fake.url, {}, store, base, opts);
+  const link = await o.begin(REDIRECT);
+  await o.complete(link.state, { code: fake.approve(link.authorization_url).code });
+  return { o, store };
+}
+const pass = (u: URL, i: RequestInit | undefined, next: FetchLike) => next(u, i);
+
+describe('review fixes', () => {
+  it('[H1] a late 401 on a request sent with the old token does not wipe the freshly refreshed tokens', async () => {
+    let gate!: () => void;
+    const held = new Promise<void>((r) => { gate = r; });
+    let holdNext = false;
+    const { o, store } = await direct(async (u, i, next) => {
+      if (holdNext && u.pathname === '/mcp') { holdNext = false; const res = await next(u, i); await held; return res; }
+      return next(u, i);
+    });
+    const t1 = store.readTokens(fake.url)!.access_token;
+    fake.expireAccessTokens();
+    holdNext = true;
+    const b = o.fetch(fake.url, post()); // goes out with t1; its 401 is held back
+    await until(() => !holdNext, 'B sent');
+    const a = await o.fetch(fake.url, post()); // 401 -> refresh -> t2
+    expect(a.status).toBe(200);
+    const t2 = store.readTokens(fake.url)!.access_token;
+    expect(t2).not.toBe(t1);
+    gate();
+    const late = await b; // its 401 arrives after the rotation
+    expect(late.status).toBe(200);
+    expect(store.readTokens(fake.url)?.access_token).toBe(t2);
+    expect(fake.tokenRequests.filter((r) => r['grant_type'] === 'refresh_token')).toHaveLength(1);
+  });
+
+  it('[H2] a token endpoint that never answers times out: exchange_failed, and refresh_failed without losing the tokens on disk', async () => {
+    let hangToken = false;
+    const hook = (u: URL, i: RequestInit | undefined, next: FetchLike) => {
+      if (hangToken && u.pathname === '/oauth/token') {
+        return new Promise<Response>((_, reject) => i?.signal?.addEventListener('abort', () => reject(i.signal!.reason)));
+      }
+      return next(u, i);
+    };
+    const { o, store } = await direct(hook, { timeoutMs: 300 });
+    hangToken = true;
+    const link = await o.begin(REDIRECT);
+    const started = Date.now();
+    await expect(o.complete(link.state, { code: fake.approve(link.authorization_url).code })).rejects.toMatchObject({ code: 'exchange_failed', message: expect.stringMatching(/did not answer/) });
+    expect(Date.now() - started).toBeLessThan(3000);
+    fake.expireAccessTokens();
+    await expect(o.fetch(fake.url, post())).rejects.toBeInstanceOf(NeedsAuthError);
+    expect(store.readTokens(fake.url)).not.toBeNull(); // not refused, just unanswered
+  });
+
+  it('[M3] refuses internal and plain-http OAuth endpoints for a public upstream, and oversized metadata', async () => {
+    const seen: string[] = [];
+    let asUrl = 'https://169.254.169.254';
+    let huge = false;
+    const stub: FetchLike = async (input) => {
+      const u = new URL(String(input));
+      seen.push(u.href);
+      if (u.pathname === '/mcp') return new Response(null, { status: 401, headers: { 'WWW-Authenticate': 'Bearer resource_metadata="https://kaizen.invalid/.well-known/oauth-protected-resource/mcp"' } });
+      if (u.pathname.startsWith('/.well-known/oauth-protected-resource')) return Response.json({ resource: 'https://kaizen.invalid/mcp', authorization_servers: [asUrl] });
+      if (huge) return new Response('x'.repeat(2 * 1024 * 1024), { headers: { 'content-type': 'application/json' } });
+      return new Response('{}', { status: 404 });
+    };
+    const o = new UpstreamOAuth('kz', 'https://kaizen.invalid/mcp', {}, new OAuthStore(join(dir, 'x')), stub);
+    await expect(o.begin(REDIRECT)).rejects.toMatchObject({ code: 'discovery_failed' });
+    expect(seen.some((h) => h.includes('169.254'))).toBe(false);
+    asUrl = 'http://auth.kaizen.invalid';
+    const o2 = new UpstreamOAuth('kz', 'https://kaizen.invalid/mcp', {}, new OAuthStore(join(dir, 'x')), stub);
+    await expect(o2.begin(REDIRECT)).rejects.toMatchObject({ code: 'discovery_failed' });
+    expect(seen.some((h) => h.startsWith('http://auth.'))).toBe(false);
+    asUrl = 'https://auth.kaizen.invalid';
+    huge = true;
+    const o3 = new UpstreamOAuth('kz', 'https://kaizen.invalid/mcp', {}, new OAuthStore(join(dir, 'x')), stub);
+    await expect(o3.begin(REDIRECT)).rejects.toMatchObject({ code: 'discovery_failed', message: expect.stringMatching(/no authorization server metadata|more than/) });
+  });
+
+  it('[M4] concurrent sign-ins register once, and a refresh uses the client that issued the tokens', async () => {
+    const store = new OAuthStore(join(dir, 'mcp-oauth'));
+    const o = new UpstreamOAuth('kz', fake.url, {}, store);
+    const [l1, l2] = await Promise.all([o.begin(REDIRECT), o.begin(REDIRECT)]);
+    expect(fake.registrations).toHaveLength(1);
+    await o.complete(l2.state, { code: fake.approve(l2.authorization_url).code });
+    expect(l1.state).not.toBe(l2.state);
+    // Someone else's registration lands in the client file afterwards.
+    store.writeClient(fake.url, REDIRECT, { client_id: 'someone-else', redirect_uris: [REDIRECT] });
+    fake.expireAccessTokens();
+    expect((await o.fetch(fake.url, post())).status).toBe(200);
+    expect(fake.tokenRequests.at(-1)).toMatchObject({ grant_type: 'refresh_token', client_id: expect.stringMatching(/^client-/) });
+  });
+
+  it('[M5] refuses two OAuth upstreams on one url', () => {
+    expect(() => parseUpstreamConfig({ a: { url: 'https://k/mcp', auth: 'oauth' }, b: { url: 'https://k/mcp', auth: 'oauth' } })).toThrow(/same url as "a"/);
+    expect(() => parseUpstreamConfig({ a: { url: 'https://k/mcp', auth: 'oauth' }, b: { url: 'https://k/mcp' } })).not.toThrow();
+  });
+
+  it('[L6] forget during a refresh is not undone by the refresh finishing', async () => {
+    let gate!: () => void;
+    const held = new Promise<void>((r) => { gate = r; });
+    let hold = false;
+    const { o, store } = await direct(async (u, i, next) => {
+      if (hold && u.pathname === '/oauth/token') { hold = false; const res = await next(u, i); await held; return res; }
+      return next(u, i);
+    });
+    fake.expireAccessTokens();
+    hold = true;
+    const p = o.fetch(fake.url, post());
+    await until(() => !hold, 'refresh sent');
+    o.forget();
+    gate();
+    await expect(p).rejects.toBeInstanceOf(NeedsAuthError);
+    expect(store.readTokens(fake.url)).toBeNull();
+    expect(o.hasToken()).toBe(false);
+  });
+
+  it('[L8] an early refresh that gets no answer keeps the still-valid token', async () => {
+    fake.knobs.expiresIn = 30; // inside the refresh margin, not expired
+    let down = false;
+    const { o } = await direct((u, i, next) => (down && u.pathname === '/oauth/token' ? Promise.reject(new Error('ECONNRESET')) : next(u, i)));
+    down = true;
+    expect((await o.fetch(fake.url, post())).status).toBe(200);
+    expect(fake.bearers.at(-1)).toBe(fake.issued[0]);
+  });
+});

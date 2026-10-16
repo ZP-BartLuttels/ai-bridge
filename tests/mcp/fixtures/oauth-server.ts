@@ -65,7 +65,7 @@ function makeMcp(state: { lastToken: string | null }): Server {
 export async function startFakeOAuth(): Promise<FakeOAuth> {
   const codes = new Map<string, Code>();
   const access = new Map<string, number>(); // token -> expires at ms
-  const refresh = new Set<string>();
+  const refresh = new Map<string, string>(); // refresh token -> client_id
   const clients = new Map<string, Record<string, unknown>>();
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const mcpState = { lastToken: null as string | null };
@@ -87,11 +87,11 @@ export async function startFakeOAuth(): Promise<FakeOAuth> {
     },
     expireAccessTokens() { for (const k of access.keys()) access.set(k, 0); },
   };
-  const mint = () => {
+  const mint = (clientId: string) => {
     const a = `at-${randomUUID()}`;
     const r = `rt-${randomUUID()}`;
     access.set(a, Date.now() + fake.knobs.expiresIn * 1000);
-    refresh.add(r);
+    refresh.set(r, clientId);
     fake.issued.push(a);
     return { access_token: a, refresh_token: r, token_type: 'Bearer', expires_in: fake.knobs.expiresIn };
   };
@@ -137,14 +137,16 @@ export async function startFakeOAuth(): Promise<FakeOAuth> {
           }
           const challenge = createHash('sha256').update(p['code_verifier'] ?? '').digest('base64url');
           if (challenge !== c.challenge) return json(res, 400, { error: 'invalid_grant', error_description: 'PKCE' });
-          return json(res, 200, mint());
+          return json(res, 200, mint(c.client_id));
         }
         if (p['grant_type'] === 'refresh_token') {
           if (fake.knobs.failRefresh || !refresh.has(p['refresh_token'] ?? '')) {
             return json(res, 400, { error: 'invalid_grant', error_description: 'refresh token revoked' });
           }
+          const owner = refresh.get(p['refresh_token']!)!;
+          if (owner !== p['client_id']) return json(res, 400, { error: 'invalid_grant', error_description: 'issued to another client' });
           refresh.delete(p['refresh_token']!);
-          return json(res, 200, mint());
+          return json(res, 200, mint(owner));
         }
         return json(res, 400, { error: 'unsupported_grant_type' });
       }
