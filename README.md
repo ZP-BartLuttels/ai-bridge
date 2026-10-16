@@ -520,6 +520,12 @@ granting them.
   the bridge's own (which holds its token).
 - A server that fails is retried with backoff; one that drops is reconnected on
   next use. Its tools stay listed meanwhile.
+- An HTTP server that requires OAuth (`"auth": "oauth"`) is signed in to the
+  way claude.ai connects a custom connector: discovery, dynamic client
+  registration and PKCE by the bridge, a "Connect" link the web application
+  shows you, and the code relayed back over the WebSocket. Tokens stay on the
+  bridge (`AI_BRIDGE_DATA_DIR/mcp-oauth`, 0600), are refreshed by it, and never
+  reach the web application. PROTOCOL.md, "Upstream sign-in (OAuth)".
 
 The file format, secrets and reconnect rules: [docs/mcp-upstreams.md](docs/mcp-upstreams.md).
 The wire frames (`hello.mcp_apps`, `tool_result.ui`, `mcp_request`/`mcp_result`):
