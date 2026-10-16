@@ -130,7 +130,13 @@ tokens.
   token, you are asked to sign in again.
 - **Signing out** happens from the web application ("forget"): the bridge
   deletes the tokens, keeps the registration, and asks again only when you
-  click Connect.
+  click Connect (or after the bridge restarts).
+- **Endpoints** the server's metadata names must be `https://` (plain http
+  only to localhost), and may not be internal addresses unless the MCP server
+  itself is on one. Each request to them gives up after 15 s and reads at most
+  1 MB.
+- **One OAuth server per url**: two entries with the same `url` and
+  `"auth": "oauth"` are refused at start.
 - **A web application that does not support it** (no redirect address): the
   server stays waiting for a sign-in (`needs_auth`, `no_redirect_uri` in its
   status) and its tools are not offered.

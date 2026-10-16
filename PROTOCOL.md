@@ -2380,8 +2380,9 @@ tools, tells the CLI that its tool list changed, and sends `upstream_status`.
 
 Forget this upstream's tokens on this bridge. The client registration stays.
 The upstream goes to `needs_auth`, followed by `upstream_status`. No
-`upstream_auth_required` is sent (not even on a later connection) until
-`upstream_auth_start`. Unknown or non-OAuth server: ignored, with a log line; no
+`upstream_auth_required` is sent, on this or a later server connection, until
+`upstream_auth_start`. That holds until the bridge restarts: it is not
+persisted, so a restarted bridge, finding no token, asks again (`no_token`). Unknown or non-OAuth server: ignored, with a log line; no
 answer.
 
 ### What the bridge does
@@ -2409,8 +2410,23 @@ answer.
 - **Refresh:** a minute before expiry, or on a 401, refresh once. If that fails,
   `needs_auth` and `upstream_auth_required` with `refresh_failed`. A 401 to a
   token that has no refresh token, or to a freshly refreshed one, is `rejected`.
-  A refresh token the authorization server refused is deleted; one that could
-  not be tried (network) stays on disk for the next start.
+  A token that has expired with no refresh token is dropped, and the next
+  request goes without one, so that is reported as `no_token`. A refresh token
+  the authorization server refused is deleted; one that could not be tried
+  (network, timeout) stays on disk for the next start, and an early refresh
+  that got no answer keeps using the access token until it really expires. A
+  401 that arrives for a request sent with a token that has since been
+  refreshed is retried with the new one; it never discards it. A refresh uses
+  the client registration that issued the tokens (stored with them).
+- **Requests to the authorization server and for metadata** (not MCP traffic)
+  time out after 15 s and read at most 1 MB. Their URLs come from documents the
+  upstream serves, so they must be `https:` (plain `http:` only to loopback),
+  and an internal address (loopback, private, link-local, CGNAT, unique-local)
+  is refused unless the upstream's own host is one. Redirects are followed only
+  within the same origin. Each `upstream_auth_start` / `upstream_auth_code`
+  still gets exactly one answer when one of these fails.
+- **One OAuth upstream per url**: two with the same `url` are refused at start,
+  because they would share (and rotate away) one set of tokens.
 - `mcp_request` / `mcp_result` semantics are otherwise unchanged.
 
 ---
