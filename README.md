@@ -499,7 +499,7 @@ A server can add text to the system prompt of every subagent Claude starts in a 
 
 ## Thinking level per request
 
-A server can pick Claude's thinking level for a turn with `options.effort` on `ai_request`: one of `low`, `medium`, `high`, `xhigh`, `max`, passed as `--effort <level>` on fresh and resumed turns. Any other value is ignored (logged at debug) and the turn runs at the CLI's default; no value changes nothing. The bridge lists the levels in `hello.effort_levels`. Codex and Gemini ignore it. Details in [PROTOCOL.md](PROTOCOL.md#additive-option-effort--the-claude-thinking-level).
+A server can pick Claude's thinking level for a turn with `options.effort` on `ai_request`: one of `low`, `medium`, `high`, `xhigh`, `max`, passed as `--effort <level>` on fresh and resumed turns. Any other value is ignored (logged at debug) and the turn runs at the CLI's default; no value changes nothing. The bridge lists the levels in `hello.effort_levels`. Codex and Gemini ignore it. Since 0.32.0; `xhigh` needs Claude Code 2.1.111+. Details in [PROTOCOL.md](PROTOCOL.md#additive-option-effort--the-claude-thinking-level).
 
 ## MCP servers of your own (MCP Apps)
 

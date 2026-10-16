@@ -317,7 +317,7 @@ This bridge sends the [`input_closed`](#input_closed) stream event when a turn w
 { "type": "hello", "...": "...", "effort_levels": ["low", "medium", "high", "xhigh", "max"] }
 ```
 
-The values this bridge takes for [`options.effort`](#additive-option-effort--the-claude-thinking-level), the Claude thinking level. Sent whichever providers are detected; Codex and Gemini ignore the option. Absent from a bridge that predates it, which drops the option and runs every turn at the CLI's default: a server that lets a person pick a level says it was not applied rather than implying it was.
+Since ai-bridge 0.32.0. The values this bridge takes for [`options.effort`](#additive-option-effort--the-claude-thinking-level), the Claude thinking level. Sent whichever providers are detected; Codex and Gemini ignore the option. Absent from a bridge that predates it, which drops the option and runs every turn at the CLI's default: a server that lets a person pick a level says it was not applied rather than implying it was.
 
 ### Bridge → Server: `providers_update`
 
@@ -943,7 +943,7 @@ It is still one process per turn: the process ends when the turn does. There is 
 "options": { "effort": "high" }
 ```
 
-Claude only. One of `hello.effort_levels` — `low`, `medium`, `high`, `xhigh`, `max` — and the bridge starts the CLI with `--effort <level>`, on a fresh turn and on a resumed one alike (like `--model`, it is per invocation, so a server sends it on every turn it wants it for). Verified on Claude Code 2.1.287, also together with `--resume`.
+Since ai-bridge 0.32.0. Claude only. One of `hello.effort_levels` — `low`, `medium`, `high`, `xhigh`, `max` — and the bridge starts the CLI with `--effort <level>`, on a fresh turn and on a resumed one alike (like `--model`, it is per invocation, so a server sends it on every turn it wants it for). Verified on Claude Code 2.1.287, also together with `--resume`. `--effort` itself is older; `xhigh` needs Claude Code 2.1.111+; on models without `xhigh` the CLI falls back to `high`.
 
 Any other value is **ignored**, logged at debug: the turn runs exactly as if the option were absent, at the CLI's default level, and nothing is reported to the server. Absent, `null` or `""` means today's behaviour exactly — no flag. Codex and Gemini ignore the option, and so does a bridge without `hello.effort_levels`.
 
