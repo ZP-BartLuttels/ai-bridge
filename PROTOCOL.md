@@ -20,6 +20,7 @@ Specification for the WebSocket protocol between `@tetrixdev/ai-bridge` (npm, cl
 - [Streaming Events](#streaming-events)
 - [Tool Calls](#tool-calls)
 - [MCP Apps](#mcp-apps)
+- [Upstream sign-in (OAuth)](#upstream-sign-in-oauth)
 - [Heartbeat](#heartbeat)
 - [Error Handling](#error-handling)
 - [Provider Reference](#provider-reference)
@@ -278,6 +279,14 @@ This bridge understands [`app_call`](#app-backends). Sent whatever `--local-tool
 
 This bridge implements [MCP Apps](#mcp-apps): `spec` is the ext-apps revision, `revision` the revision of the bridge's own MCP Apps frames. Absent from a bridge that predates them; a server then tells the person to update it and must not send `mcp_request`.
 
+#### Additive field: `mcp_upstream_auth`
+
+```json
+{ "type": "hello", "...": "...", "mcp_upstream_auth": { "revision": 1 } }
+```
+
+This bridge implements [upstream sign-in (OAuth)](#upstream-sign-in-oauth). Absent from a bridge that predates it; a server must not send it `upstream_auth_start`, `upstream_auth_code` or `upstream_auth_forget`.
+
 #### Additive field: `space_files`
 
 ```json
@@ -426,6 +435,14 @@ The system prompt behaves the same in every mode: the server's `system_prompt` w
 `bridge__attach_file` is offered in `workspace` and `native` only. In `isolated` the CLI reaches server-declared tools and nothing else, which is what the row above says and what it should keep meaning.
 
 **Gemini and `working_dir`.** Gemini is the one CLI with no per-invocation MCP config flag — it reads `.gemini/settings.json` from cwd. When cwd is a developer's checkout the bridge therefore writes into it, and handles that explicitly: it **refuses the turn rather than overwriting** a settings file the repository already has, removes the one it wrote when the turn ends (`done`, `error` or `cancel`), and removes the `.gemini` directory too if it created it and nothing else is in it. Because there is only one such path per directory and the file carries a per-spawn bearer token, **two concurrent Gemini turns in one directory are refused** rather than allowed to race — the loser would otherwise read the winner's credential and have its tool calls routed to the other turn's request.
+
+#### `upstream_oauth`
+
+```json
+{ "type": "welcome", "...": "...", "upstream_oauth": { "redirect_uri": "https://app.example/ai-bridge/upstream-oauth/callback" } }
+```
+
+Where the authorization server sends the browser back after a person signs in to an OAuth upstream MCP server. See [Upstream sign-in (OAuth)](#upstream-sign-in-oauth). Absent: OAuth upstreams on this bridge cannot be signed in to through this server.
 
 #### `desired_bridge_version`
 
@@ -2202,6 +2219,218 @@ that bridge is gone, the server has nobody to relay to.
 
 ---
 
+## Upstream sign-in (OAuth)
+
+An [upstream MCP server](#mcp-apps) that requires OAuth (the MCP authorization
+spec: RFC 9728 protected resource metadata, RFC 8414 / OIDC discovery, RFC 7591
+dynamic client registration, PKCE S256, RFC 8707 `resource`) can be used through
+the bridge the way claude.ai uses a custom connector. The person signs in once
+in their browser; the bridge holds and refreshes the tokens; the web
+application only relays the one-time code and never sees a token.
+
+**Why the code goes through the server.** The bridge usually runs on a machine
+the person is not sitting at, so a `localhost` redirect cannot work. The
+redirect goes to the web application, which the person's browser can reach, and
+the web application passes the code to the bridge over this WebSocket. Only the
+bridge holds the PKCE verifier, so only the bridge can turn the code into
+tokens.
+
+The operator opts an upstream in, in the `--mcp-upstreams` file
+([docs/mcp-upstreams.md](docs/mcp-upstreams.md)):
+
+```json
+{ "mcpServers": {
+  "kaizen": { "url": "https://kaizen.example/mcp", "auth": "oauth",
+              "oauth": { "scope": "optional space-separated scopes", "client_name": "optional, default 'AI Bridge'" } }
+} }
+```
+
+`auth` is `"oauth"` or absent; `"oauth"` only with `url`, never with an
+`Authorization` header, and `oauth` takes no keys but these two. Anything else
+stops the bridge at start.
+
+### Handshake: `hello.mcp_upstream_auth`
+
+```json
+{ "type": "hello", "...": "...", "mcp_upstream_auth": { "revision": 1 } }
+```
+
+Present when the bridge implements everything in this section, whether or not
+it has OAuth upstreams. A server must not send `upstream_auth_start`,
+`upstream_auth_code` or `upstream_auth_forget` to a bridge without it.
+
+### Handshake: `welcome.upstream_oauth`
+
+```json
+{ "type": "welcome", "...": "...", "upstream_oauth": { "redirect_uri": "https://app.example/ai-bridge/upstream-oauth/callback" } }
+```
+
+The absolute `http(s)` URL the authorization server sends the browser back to,
+used exactly as sent (it is registered and compared character for character).
+Absent (or not an absolute http(s) URL): the bridge cannot sign in to any OAuth
+upstream through this server; those upstreams report `needs_auth` with
+`error: "no_redirect_uri"`, and no `upstream_auth_required` is sent.
+
+### Bridge → Server: `upstream_status`
+
+Sent once after `welcome` (by a bridge with upstreams configured), and again
+whenever any upstream's state, auth or tool count changes. Always the complete
+list.
+
+```json
+{ "type": "upstream_status", "upstreams": [
+  { "server": "kaizen", "transport": "http", "origin": "https://kaizen.example", "auth": "oauth",
+    "state": "needs_auth", "tools": 0, "error": "no_token" },
+  { "server": "weather", "transport": "stdio", "origin": null, "auth": "secrets",
+    "state": "connected", "tools": 3, "error": null }
+] }
+```
+
+| Field | Values |
+|---|---|
+| `transport` | `http` or `stdio` |
+| `origin` | For http: scheme + host + port only, never a path or query. For stdio: null. |
+| `auth` | `none`, `secrets` (env/headers resolved from env or vault), or `oauth` |
+| `state` | `connecting`, `connected`, `needs_auth`, or `unavailable` |
+| `tools` | The number offered (0 unless connected) |
+| `error` | A short machine code or message when `unavailable` or `needs_auth`, else null. Never contains a secret. |
+
+For `needs_auth`, `error` is a machine code: `no_token`, `refresh_failed`,
+`rejected`, `no_redirect_uri`, or the `code` of the last failed sign-in
+(`denied`, `discovery_failed`, `registration_failed`, `exchange_failed`,
+`issuer_mismatch`). For `unavailable` it is the connection error, redacted.
+
+### Bridge → Server: `upstream_auth_required`
+
+```json
+{ "type": "upstream_auth_required", "server": "kaizen", "state": "Xb3…",
+  "authorization_url": "https://kaizen.example/oauth/authorize?response_type=code&client_id=…&redirect_uri=…&code_challenge=…&code_challenge_method=S256&state=Xb3…&resource=…",
+  "expires_at": "2026-10-16T18:10:00Z", "reason": "no_token" }
+```
+
+Open `authorization_url` in the person's browser (or show them a "Connect
+kaizen" link to it).
+
+- `reason`: `no_token`, `refresh_failed`, `rejected` (the upstream answered 401
+  to a token it had issued), or `requested` (answering `upstream_auth_start`).
+- **When it is sent:** when an OAuth upstream has no usable token at connect,
+  once per connection to this server; when refreshing fails, or the upstream
+  rejects the token; in answer to `upstream_auth_start`.
+- **`state`:** 32 random bytes, base64url. At most one sign-in is pending per
+  upstream, so a new one invalidates the previous `state`. A `state` expires
+  after 10 minutes (`expires_at`, UTC) and can be used once.
+- **Before it is sent** the bridge has done discovery and client registration.
+  A failure there is reported as `upstream_auth_result` with `ok: false` and
+  `state: null` instead.
+
+### Server → Bridge: `upstream_auth_start`
+
+```json
+{ "type": "upstream_auth_start", "server": "kaizen" }
+```
+
+The person asked to (re)connect. Answered with `upstream_auth_required`
+(`reason: "requested"`), or with `upstream_auth_result` `ok: false`
+(`unknown_server`, `not_oauth`, `no_redirect_uri`, `discovery_failed`,
+`registration_failed`).
+
+### Server → Bridge: `upstream_auth_code`
+
+```json
+{ "type": "upstream_auth_code", "server": "kaizen", "state": "Xb3…", "code": "def50200…", "iss": "https://kaizen.example" }
+{ "type": "upstream_auth_code", "server": "kaizen", "state": "Xb3…", "error": "access_denied", "error_description": "The user denied the request" }
+```
+
+The query parameters of the redirect, passed on as they are. `iss` is optional
+(RFC 9207). The bridge checks it when the authorization server's metadata says
+it sends `iss` (`authorization_response_iss_parameter_supported`), and whenever
+it is present: it must equal the metadata's `issuer`.
+
+### Bridge → Server: `upstream_auth_result`
+
+Exactly one per `upstream_auth_code`, and also the failure answer to
+`upstream_auth_start` (and to a sign-in the bridge could not prepare by itself).
+
+```json
+{ "type": "upstream_auth_result", "server": "kaizen", "state": "Xb3…", "ok": true }
+{ "type": "upstream_auth_result", "server": "kaizen", "state": "Xb3…", "ok": false, "code": "unknown_state", "error": "This sign-in link expired or was replaced by a newer one." }
+```
+
+| `code` | Meaning |
+|---|---|
+| `unknown_server` | No upstream of that name on this bridge (or none at all). |
+| `not_oauth` | The upstream is not configured with `"auth": "oauth"`. |
+| `unknown_state` | The `state` expired, was used, or was superseded by a newer link. Changes nothing. |
+| `denied` | The person refused at the authorization server (`error=access_denied`). |
+| `no_redirect_uri` | This server's `welcome` carried no `upstream_oauth.redirect_uri`. |
+| `discovery_failed` | Protected resource or authorization server metadata could not be found, or it cannot do `code` + S256. |
+| `registration_failed` | Dynamic client registration was refused or is not offered. |
+| `exchange_failed` | The token endpoint refused the code, the redirect carried no code, or carried an `error` other than `access_denied`. |
+| `issuer_mismatch` | `iss` missing where the metadata promises it, or not the metadata's `issuer`. |
+
+`state` is null when there was none (`upstream_auth_start`). `error` is for
+people and never contains a secret. On `ok: true` the bridge connects, lists the
+tools, tells the CLI that its tool list changed, and sends `upstream_status`.
+
+### Server → Bridge: `upstream_auth_forget`
+
+```json
+{ "type": "upstream_auth_forget", "server": "kaizen" }
+```
+
+Forget this upstream's tokens on this bridge. The client registration stays.
+The upstream goes to `needs_auth`, followed by `upstream_status`. No
+`upstream_auth_required` is sent, on this or a later server connection, until
+`upstream_auth_start`. That holds until the bridge restarts: it is not
+persisted, so a restarted bridge, finding no token, asks again (`no_token`). Unknown or non-OAuth server: ignored, with a log line; no
+answer.
+
+### What the bridge does
+
+- **Discovery and registration.** A request without a token; a 401 with
+  `WWW-Authenticate: Bearer resource_metadata=…` leads to the protected
+  resource metadata, then the authorization server metadata (RFC 8414, falling
+  back to OIDC discovery). Dynamic client registration with
+  `redirect_uris: [redirect_uri]`, `grant_types: [authorization_code,
+  refresh_token]`, `response_types: [code]`, `token_endpoint_auth_method: none`
+  (a public client) and `client_name`. The authorization request carries
+  PKCE S256, `state`, `resource` (RFC 8707, from the protected resource
+  metadata) and `scope` (the configured one, else the resource's
+  `scopes_supported`).
+- **Storage**, under `AI_BRIDGE_DATA_DIR` (default `~/.ai-bridge`), in
+  `mcp-oauth/`: the directory 0700, every file 0600. The client registration is
+  keyed by (the upstream's `url`, `redirect_uri`), so a bridge serving two web
+  applications registers once per redirect; tokens are keyed by the upstream's
+  `url`. Tokens are never logged and never sent to the server; every token value
+  joins the upstream's redaction set (model text, host results, errors, stderr).
+- **While `needs_auth`:** none of that upstream's tools are offered to the CLI.
+  A call by name answers with an error telling the model the person has been
+  asked to sign in. `mcp_request` to it answers `code: "unavailable"` with an
+  error saying a sign-in is needed. Not retried in the background.
+- **Refresh:** a minute before expiry, or on a 401, refresh once. If that fails,
+  `needs_auth` and `upstream_auth_required` with `refresh_failed`. A 401 to a
+  token that has no refresh token, or to a freshly refreshed one, is `rejected`.
+  A token that has expired with no refresh token is dropped, and the next
+  request goes without one, so that is reported as `no_token`. A refresh token
+  the authorization server refused is deleted; one that could not be tried
+  (network, timeout) stays on disk for the next start, and an early refresh
+  that got no answer keeps using the access token until it really expires. A
+  401 that arrives for a request sent with a token that has since been
+  refreshed is retried with the new one; it never discards it. A refresh uses
+  the client registration that issued the tokens (stored with them).
+- **Requests to the authorization server and for metadata** (not MCP traffic)
+  time out after 15 s and read at most 1 MB. Their URLs come from documents the
+  upstream serves, so they must be `https:` (plain `http:` only to loopback),
+  and an internal address (loopback, private, link-local, CGNAT, unique-local)
+  is refused unless the upstream's own host is one. Redirects are followed only
+  within the same origin. Each `upstream_auth_start` / `upstream_auth_code`
+  still gets exactly one answer when one of these fails.
+- **One OAuth upstream per url**: two with the same `url` are refused at start,
+  because they would share (and rotate away) one set of tokens.
+- `mcp_request` / `mcp_result` semantics are otherwise unchanged.
+
+---
+
 ## Heartbeat
 
 Keeps the WebSocket alive and detects dead connections.
@@ -2411,6 +2640,9 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `stream` (error) | Error during streaming |
 | `tool_call` | CLI invoked a server-side tool (via callback) |
 | `mcp_result` | Answering an `mcp_request`: a result, or an error with a code |
+| `upstream_status` | After `welcome`, and whenever an upstream's state, auth or tool count changes |
+| `upstream_auth_required` | An OAuth upstream needs the person to sign in: a link to open |
+| `upstream_auth_result` | Answering an `upstream_auth_code` (or a failed `upstream_auth_start`) |
 | `cancelled` | A turn stopped because the server asked |
 | `local_result` | Answering a `local_call`, run or refused |
 | `error` | Request-level error (non-streaming) |
@@ -2433,6 +2665,9 @@ Treating the first `result` as terminal is what this replaces, and it was not a 
 | `file_read` | Hand a recorded file back, by id, to a one-time URL |
 | `file_read_cancel` | Stop handing a file back |
 | `mcp_request` | A view asks its upstream MCP server for something (`resources/read`, `tools/call`) |
+| `upstream_auth_start` | The person asked to (re)connect an OAuth upstream |
+| `upstream_auth_code` | The sign-in redirect's parameters, passed on |
+| `upstream_auth_forget` | Forget an OAuth upstream's tokens on this bridge |
 
 ---
 
@@ -2484,6 +2719,8 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 **Announcing the input's close does not bump the version.** `hello.input_closed` and the `input_closed` stream event are additive: a consumer ignores an event it does not know, and a server that does not see the flag learns the close the way it always did, from `turn_ending`.
 
 **MCP Apps do not bump the version.** `hello.mcp_apps`, `welcome.tools[]._meta`, `tool_call.provider_tool_call_id`, `tool_result.ui`, `mcp_request` and `mcp_result` are additive; their own shape is versioned by `hello.mcp_apps.revision`.
+
+**Upstream sign-in does not bump the version.** `hello.mcp_upstream_auth`, `welcome.upstream_oauth`, `upstream_status` and the `upstream_auth_*` frames are additive; their shape is versioned by `hello.mcp_upstream_auth.revision`, and a server must not send the server→bridge frames to a bridge without it.
 
 **Self-update does not bump the version.** `welcome.desired_bridge_version` and `hello.self_update` are additive in both directions.
 

@@ -17,9 +17,11 @@
  */
 
 import { MCP_APPS_BRIDGE_REVISION, MCP_APPS_SPEC, UpstreamError, UpstreamHub, type SecretRef, type UpstreamConfig } from './mcp/upstream.js';
+import { MCP_UPSTREAM_AUTH_REVISION } from './mcp/oauth.js';
 import { createReadStream, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
+import { homedir } from 'node:os';
 import WebSocket from 'ws';
 import type {
   ProviderCapability,
@@ -108,6 +110,11 @@ const log = createLogger('Bridge');
 export interface BridgeOptions {
   /** MCP Apps: MCP servers to connect to and offer to the CLI, by name (src/mcp/upstream.ts). */
   mcpUpstreams?: Record<string, UpstreamConfig>;
+  /**
+   * Where OAuth upstreams' client registrations and tokens are kept
+   * (src/mcp/oauth.ts). Default `<AI_BRIDGE_DATA_DIR or ~/.ai-bridge>/mcp-oauth`.
+   */
+  mcpOAuthDir?: string;
   /**
    * Following the server's desired version (src/selfupdate/). `enabled` is
    * what `hello.self_update` says; `onDesired` gets each welcome's
@@ -553,6 +560,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
           // A server connected, reconnected or changed its tools: the CLI's
           // next tools/list sees the new set.
           onToolsChanged: () => this.registerBridgeTools(),
+          // Upstream sign-in (OAuth): tokens stay here; only links and results go out.
+          oauthDir: options.mcpOAuthDir ?? join(process.env['AI_BRIDGE_DATA_DIR'] ?? join(homedir(), '.ai-bridge'), 'mcp-oauth'),
+          onStatusChanged: () => this.sendUpstreamStatus(),
+          sendAuthFrame: (frame) => this.send(frame),
         })
       : null;
     this.sessionWorkingDirs = new SessionWorkingDirs(
@@ -576,6 +587,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // MCP Apps: a tool of an MCP server this bridge connects to
       // itself. Run here; its view, if it names one, goes out with the
       // call's tool_result (see send()).
+      // An upstream waiting for a sign-in offers no tools; a call by name
+      // (a list the CLI read earlier) says why instead of reaching the server.
+      const signIn = this.cliIsolation === 'isolated' ? null : this.upstream?.signInNeeded(toolName);
+      if (signIn) throw new Error(signIn);
       if (this.upstream?.owns(toolName) && this.mcpServer.hasBridgeTool(toolName)) {
         const out = await this.upstream.callFromModel(toolName, args, providerToolCallId);
         if (out.isError) throw new Error(out.text);
@@ -1262,6 +1277,11 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       case 'mcp_request':
         this.handleMcpRequest(message);
         break;
+      case 'upstream_auth_start':
+      case 'upstream_auth_code':
+      case 'upstream_auth_forget':
+        this.handleUpstreamAuth(message);
+        break;
       case 'app_call':
         void this.appSupervisor.handle(message).then(
           (result) => this.send(result),
@@ -1437,6 +1457,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       this.activeRequests.clear();
     }
 
+    this.upstream?.serverDisconnected();
     this.emit('disconnected', code, reasonStr);
 
     if (!this.isShuttingDown) {
@@ -1506,6 +1527,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       // frames (mcp_request/mcp_result, tool_result.ui, welcome tool _meta,
       // provider_tool_call_id). A server reads its absence as "too old".
       mcp_apps: { spec: MCP_APPS_SPEC, revision: MCP_APPS_BRIDGE_REVISION },
+      // Upstream sign-in (OAuth) for --mcp-upstreams servers (src/mcp/oauth.ts):
+      // welcome.upstream_oauth, upstream_status, upstream_auth_* frames.
+      mcp_upstream_auth: { revision: MCP_UPSTREAM_AUTH_REVISION },
       // A space's kept files (spacefiles/store.ts): the revision of those frames.
       space_files: SPACE_FILES_REVISION,
       // App backends reach only their declared hosts (apps/guard.ts, apps/egress.ts).
@@ -1829,6 +1853,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     });
 
     this.emit('welcome', this.sessionId);
+
+    // Upstream sign-in: upstream_status once now, and a sign-in link for each
+    // OAuth upstream that needs one, through this server's redirect address.
+    this.upstream?.serverConnected(upstreamRedirectUri(message));
 
     // Re-probe the local CLIs now that the handshake is fully complete. The
     // hello above already advertised the last-known set; if detection now
@@ -2620,6 +2648,45 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     );
   }
 
+  private sendUpstreamStatus(): void {
+    if (this.upstream) this.send({ type: 'upstream_status', upstreams: this.upstream.upstreamStatus() });
+  }
+
+  /** upstream_auth_start / _code / _forget. A bridge without upstreams answers as for an unknown server. */
+  private handleUpstreamAuth(
+    message: import('./protocol/types.js').UpstreamAuthStartMessage
+      | import('./protocol/types.js').UpstreamAuthCodeMessage
+      | import('./protocol/types.js').UpstreamAuthForgetMessage,
+  ): void {
+    const server = typeof message.server === 'string' ? message.server : '';
+    const hub = this.upstream;
+    const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined);
+    if (message.type === 'upstream_auth_forget') {
+      if (hub) void hub.authForget(server);
+      else log.info('upstream_auth_forget on a bridge with no upstreams; ignored', { server });
+      return;
+    }
+    if (!hub) {
+      this.send({
+        type: 'upstream_auth_result', server,
+        state: message.type === 'upstream_auth_code' ? str(message.state) ?? null : null,
+        ok: false, code: 'unknown_server', error: `no upstream MCP servers on this bridge (server ${server})`,
+      });
+      return;
+    }
+    if (message.type === 'upstream_auth_start') {
+      void hub.authStart(server);
+      return;
+    }
+    const params = {
+      ...(str(message.code) !== undefined ? { code: str(message.code)! } : {}),
+      ...(str(message.error) !== undefined ? { error: str(message.error)! } : {}),
+      ...(str(message.error_description) !== undefined ? { error_description: str(message.error_description)! } : {}),
+      ...(str(message.iss) !== undefined ? { iss: str(message.iss)! } : {}),
+    };
+    void hub.authCode(server, message.state, params);
+  }
+
   private send(message: BridgeToServerMessage): void {
     // MCP Apps: the first tool_result of a call whose upstream
     // tool names a view carries what the host needs to draw it.
@@ -2829,5 +2896,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
       event,
       data,
     });
+  }
+}
+
+/** welcome.upstream_oauth.redirect_uri when it is an absolute http(s) URL; null otherwise. */
+function upstreamRedirectUri(message: WelcomeMessage): string | null {
+  const raw = (message.upstream_oauth as { redirect_uri?: unknown } | undefined)?.redirect_uri;
+  if (typeof raw !== 'string') return null;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+    // As sent: it is registered and compared character for character.
+    return raw;
+  } catch {
+    return null;
   }
 }

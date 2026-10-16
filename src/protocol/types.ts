@@ -272,6 +272,13 @@ export interface HelloMessage {
    */
   mcp_apps?: { spec: string; revision: number };
   /**
+   * This bridge implements upstream sign-in (OAuth) for its `--mcp-upstreams`
+   * servers: `welcome.upstream_oauth`, `upstream_status`,
+   * `upstream_auth_required` / `_start` / `_code` / `_result` / `_forget`.
+   * A server must not send the server->bridge frames to a bridge without it.
+   */
+  mcp_upstream_auth?: { revision: number };
+  /**
    * This bridge keeps an Engram space's files (`files_write`, `files_read`,
    * `files_move`, `files_purge`, answered with `files_result`) under
    * `<first allowed folder>/files/<space>/`. The number is the revision of
@@ -537,7 +544,49 @@ export interface UsageLimitFrame {
   group?: string;
 }
 
+/**
+ * Upstream sign-in: every upstream's state, the complete list. Sent once after
+ * `welcome` and again whenever an upstream's state, auth or tool count changes.
+ */
+export interface UpstreamStatusMessage {
+  type: 'upstream_status';
+  upstreams: {
+    server: string;
+    transport: 'http' | 'stdio';
+    /** http: scheme + host + port only. stdio: null. */
+    origin: string | null;
+    auth: 'none' | 'secrets' | 'oauth';
+    state: 'connecting' | 'connected' | 'needs_auth' | 'unavailable';
+    tools: number;
+    error: string | null;
+  }[];
+}
+
+/** Upstream sign-in: a person has to sign in; open `authorization_url` in their browser. */
+export interface UpstreamAuthRequiredMessage {
+  type: 'upstream_auth_required';
+  server: string;
+  /** ≥32 random bytes, base64url. Good once, for 10 minutes, until a newer one replaces it. */
+  state: string;
+  authorization_url: string;
+  /** ISO 8601, UTC. */
+  expires_at: string;
+  reason: 'no_token' | 'refresh_failed' | 'rejected' | 'requested';
+}
+
+export type UpstreamAuthResultCode =
+  | 'unknown_server' | 'not_oauth' | 'unknown_state' | 'denied' | 'no_redirect_uri'
+  | 'discovery_failed' | 'registration_failed' | 'exchange_failed' | 'issuer_mismatch';
+
+/** Upstream sign-in: exactly one per `upstream_auth_code`; also the failure answer to `upstream_auth_start`. */
+export type UpstreamAuthResultMessage =
+  | { type: 'upstream_auth_result'; server: string; state: string | null; ok: true }
+  | { type: 'upstream_auth_result'; server: string; state: string | null; ok: false; code: UpstreamAuthResultCode; error: string };
+
 export type BridgeToServerMessage =
+  | UpstreamStatusMessage
+  | UpstreamAuthRequiredMessage
+  | UpstreamAuthResultMessage
   | McpResultMessage
   | HelloMessage
   | AiRequestAckMessage
@@ -633,6 +682,12 @@ export interface WelcomeMessage {
    * semver only; anything else is ignored. Absent: no opinion.
    */
   desired_bridge_version?: string;
+  /**
+   * Upstream sign-in (OAuth): the absolute URL the authorization server sends
+   * the browser back to. Absent: this server cannot relay a sign-in, and OAuth
+   * upstreams report `needs_auth` with `error: "no_redirect_uri"`.
+   */
+  upstream_oauth?: { redirect_uri: string };
 }
 
 /** Server-provided configuration values. */
@@ -1128,7 +1183,34 @@ export interface McpRequestMessage {
   params: Record<string, unknown>;
 }
 
+/** Upstream sign-in: the person asked to (re)connect `server`. */
+export interface UpstreamAuthStartMessage {
+  type: 'upstream_auth_start';
+  server: string;
+}
+
+/** Upstream sign-in: the redirect's query parameters, passed on as they are. */
+export interface UpstreamAuthCodeMessage {
+  type: 'upstream_auth_code';
+  server: string;
+  state: string;
+  code?: string;
+  /** RFC 9207, optional. */
+  iss?: string;
+  error?: string;
+  error_description?: string;
+}
+
+/** Upstream sign-in: forget this upstream's tokens on this bridge. */
+export interface UpstreamAuthForgetMessage {
+  type: 'upstream_auth_forget';
+  server: string;
+}
+
 export type ServerToBridgeMessage =
+  | UpstreamAuthStartMessage
+  | UpstreamAuthCodeMessage
+  | UpstreamAuthForgetMessage
   | McpRequestMessage
   | WelcomeMessage
   | AiRequestMessage

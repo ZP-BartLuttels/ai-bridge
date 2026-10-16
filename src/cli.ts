@@ -217,7 +217,7 @@ program
   )
   .option(
     '--mcp-upstreams <file>',
-    'A JSON file of MCP servers this bridge connects to and offers to the CLI beside the server\'s tools ({"mcpServers": {"name": {"command", "args", "env"} | {"url", "headers"}}}; secrets as {"env": "VAR"} or {"vault": {...}}, see docs/mcp-upstreams.md). Their MCP App views are passed on to the server. Or set AI_BRIDGE_MCP_UPSTREAMS.',
+    'A JSON file of MCP servers this bridge connects to and offers to the CLI beside the server\'s tools ({"mcpServers": {"name": {"command", "args", "env"} | {"url", "headers"} | {"url", "auth": "oauth"}}}; secrets as {"env": "VAR"} or {"vault": {...}}; "auth": "oauth" signs in through the web application, tokens kept in AI_BRIDGE_DATA_DIR/mcp-oauth; see docs/mcp-upstreams.md). Their MCP App views are passed on to the server. Or set AI_BRIDGE_MCP_UPSTREAMS.',
     process.env['AI_BRIDGE_MCP_UPSTREAMS'],
   )
   .option(
