@@ -1392,6 +1392,7 @@ export type ServerToBridgeMessage =
   | FilesPurgeMessage
   | SecretListMessage
   | SecretPutMessage
+  | SecretSetEndMessage
   | SecretDescribeMessage
   | SecretRemoveMessage;
 
@@ -1412,6 +1413,18 @@ export interface SecretPutMessage {
   value: string;
   description?: string;
   replace?: boolean;
+  /** Revision 3: when the secret ends (ISO 8601 UTC, whole seconds, `Z`); with `end_kind`, or neither. */
+  ends_at?: string | null;
+  end_kind?: 'expire' | 'delete' | null;
+}
+
+/** Revision 3: set a secret's end, or remove it with `ends_at: null`. Leaves the value and description alone. */
+export interface SecretSetEndMessage {
+  type: 'secret_set_end';
+  id: string;
+  name: string;
+  ends_at: string | null;
+  end_kind?: 'expire' | 'delete' | null;
 }
 
 export interface SecretDescribeMessage {
@@ -1433,7 +1446,16 @@ export interface SecretResultMessage {
   id: string;
   ok: boolean;
   /** `secret_list` only. */
-  secrets?: Array<{ name: string; description: string | null; updated_at: string | null }>;
+  secrets?: Array<{
+    name: string;
+    description: string | null;
+    updated_at: string | null;
+    ends_at: string | null;
+    end_kind: 'expire' | 'delete' | null;
+    expired_at: string | null;
+  }>;
+  /** `secret_list` only (revision 3): the ends handled in the last 30 days, at most 100. */
+  ended?: Array<{ name: string; kind: 'expire' | 'delete'; ended_at: string }>;
   /** A successful `secret_put`: whether an existing secret was overwritten. */
   replaced?: boolean;
   code?: string;

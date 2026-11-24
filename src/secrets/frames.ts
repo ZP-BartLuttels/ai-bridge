@@ -11,6 +11,7 @@ import {
   MAX_FRAME_VALUE_BYTES,
   SecretRefusal,
   MachineSecretStore,
+  type EndedRecord,
   type SecretRow,
 } from './store.js';
 
@@ -40,11 +41,20 @@ export class MachineSecrets {
     this.timeoutMs = options.timeoutMs ?? SECRET_OP_TIMEOUT_MS;
   }
 
-  list(): Promise<SecretRow[]> {
-    return this.bounded(() => this.store.list());
+  list(): Promise<{ secrets: SecretRow[]; ended: EndedRecord[] }> {
+    return this.bounded(() => this.store.listWithEnded());
   }
 
-  put(name: unknown, value: unknown, options: { replace?: unknown; description?: unknown } = {}): Promise<{ replaced: boolean }> {
+  /** Handle the ends that have passed (at start and on the bridge's timer). */
+  sweep(): Promise<EndedRecord[]> {
+    return this.bounded(() => this.store.sweep());
+  }
+
+  put(
+    name: unknown,
+    value: unknown,
+    options: { replace?: unknown; description?: unknown; endsAt?: unknown; endKind?: unknown } = {},
+  ): Promise<{ replaced: boolean }> {
     if (options.description !== undefined && options.description !== null && typeof options.description !== 'string') {
       return Promise.reject(new SecretRefusal('invalid_request', 'The description must be text.'));
     }
@@ -52,7 +62,13 @@ export class MachineSecrets {
       replace: options.replace === true,
       description: options.description as string | null | undefined,
       maxBytes: MAX_FRAME_VALUE_BYTES,
+      endsAt: options.endsAt,
+      endKind: options.endKind,
     }), typeof value === 'string' ? value : undefined);
+  }
+
+  setEnd(name: unknown, endsAt: unknown, endKind?: unknown): Promise<void> {
+    return this.bounded(() => this.store.setEnd(name, endsAt, endKind));
   }
 
   describe(name: unknown, description: unknown): Promise<void> {

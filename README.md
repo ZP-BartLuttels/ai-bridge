@@ -540,14 +540,14 @@ The bridge keeps a small secret store on this machine, `~/.ai-bridge/secrets/`:
 one file per secret, named like the secret, readable only by you (folder 0700,
 each file 0600 from the moment it exists; on Windows the modes and the owner
 check do not apply, and the folder is as private as your profile), and an `index.json` with each
-secret's description and when it was written. Your own scripts use it with
+secret's description, when it was written and when it ends, if it does. Your own scripts use it with
 `aib secret`; a server may manage it **only if you start the bridge with
 `--machine-secrets`** (or `AI_BRIDGE_MACHINE_SECRETS=1`; `install
 --machine-secrets` records it, and a reinstall without the flag turns it off).
 
 | Without `--machine-secrets` | With it |
 |---|---|
-| The log says `Machine secrets: off (no --machine-secrets)`; `ai-bridge list` shows `machine secrets: off`; the server is told nothing and every request is refused (`machine_secrets_unsupported`) | The server may list the store (names, descriptions, dates), add or replace a secret, change a description and remove one. It can never read a value back |
+| The log says `Machine secrets: off (no --machine-secrets)`; `ai-bridge list` shows `machine secrets: off`; the server is told nothing and every request is refused (`machine_secrets_unsupported`) | The server may list the store (names, descriptions, dates, ends), add or replace a secret, set or remove its end, change a description and remove one. It can never read a value back |
 
 `aib secret` works on the store either way:
 
@@ -556,6 +556,9 @@ aib secret list                                   # names, dates, descriptions; 
 printf %s "$TOKEN" | aib secret add github_token --description "GitHub, read-only"
 aib secret add tls_key --from-file ./server.key   # the file as it is
 aib secret add github_token --replace < new.txt   # an existing name needs --replace
+aib secret add rpa_pass --ends-in 8h < pass.txt   # gone in 8 hours: m, h, d or w
+aib secret add temp --ends-at 2026-12-01T15:00:00Z --delete-at-end < t.txt
+aib secret end github_token --in 30d              # or --at <time>, or --none; --delete-at-end | --expire
 aib secret describe github_token "GitHub, repo scope"
 aib secret path github_token                      # the file, for a program that reads one
 aib secret remove github_token --yes
@@ -569,6 +572,19 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   `printf %s` would; on a terminal it asks for one line without echoing it.
   `--from-file` keeps the file byte for byte.
 - **No command prints a value.**
+- **A secret can end.** `--ends-in <n>(m|h|d|w)` or `--ends-at <time>` (a
+  time with a zone, `Z` or `+01:00`; stored in UTC, whole seconds) on `add`,
+  or `aib secret end <name> (--in <n> | --at <time> | --none)` later. At the
+  end it **expires** by default: the value file is removed, the name stays in
+  `list` as `expired <time>`, and `run` and `path` refuse it (exit code 4,
+  "The secret "x" expired at ... and can no longer be used"). `add --replace`
+  renews it. With `--delete-at-end` the secret and its name are removed
+  altogether. An end is at most 10 years ahead and must be in the future;
+  `end` without a kind sets `--expire`. The store checks the ends before
+  every command and the bridge (with `--machine-secrets`) also every minute,
+  so an end that passed while nothing ran is handled at the next look.
+  `list` names the ends of the last 30 days on stderr. A replace without an
+  end clears the old one.
 - **`run <name> [--env VAR] [--dotenv] [--no-mask] -- <command...>`** starts the
   command with `SECRET_FILE` (the secret's path) and `SECRET_NAME` set.
   `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every
@@ -600,7 +616,8 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   program). The exit code is the command's; 127 when it is not found, 128 +
   the signal when it was killed. The filter is a guard against an accidental
   print, not a sandbox: a program that encodes the value (base64, URL
-  encoding) prints it.
+  encoding) prints it. A missing secret exits 2, an expired one 4, before the
+  command starts.
 - **`import <folder>`** copies every regular file whose name is a valid secret
   name, with a description from `<folder>/.desc/<name>` when there is one.
   Dot files are skipped, so is anything that is not a regular file; an

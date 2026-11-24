@@ -47,6 +47,7 @@ import type {
   FilesPurgeMessage,
   SecretListMessage,
   SecretPutMessage,
+  SecretSetEndMessage,
   SecretDescribeMessage,
   SecretRemoveMessage,
 } from './protocol/types.js';
@@ -99,7 +100,7 @@ import { assertAllowedAttachmentUrl, resolveApiOrigin } from './attachments/orig
 import { FileReadRefusal, openRecorded, resolveRange, ServedFiles } from './attachments/served.js';
 import { FilesRefusal, SPACE_FILES_REVISION, SpaceFiles } from './spacefiles/store.js';
 import { MACHINE_SECRETS_REVISION, MachineSecrets, SecretRefusal } from './secrets/frames.js';
-import { MachineSecretStore } from './secrets/store.js';
+import { MachineSecretStore, defaultSecretsDir } from './secrets/store.js';
 import { APP_NETWORK_REVISION } from './apps/egress.js';
 import { APP_CODE_REVISION } from './apps/guard.js';
 
@@ -247,6 +248,8 @@ export interface BridgeOptions {
   machineSecrets?: boolean;
   /** The store's folder; default `~/.ai-bridge/secrets`. For tests. */
   secretsDir?: string;
+  /** How often the store's ends are swept while the bridge runs; default 60 s. For tests. */
+  secretsSweepMs?: number;
 }
 
 const DEFAULT_HEARTBEAT_SECONDS = 30;
@@ -367,6 +370,8 @@ const MAX_RECONNECT_DELAY_MS = 15_000; // Cap at 15s per PROTOCOL.md
 // long a revoked device or a rotated value keeps working; not zero because
 // every local tool call would otherwise depend on Engram being reachable.
 const SECRETS_TTL_MS = 60_000;
+/** How often a bridge with --machine-secrets sweeps the store for passed ends. */
+const MACHINE_SECRETS_SWEEP_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // Bridge Events
@@ -627,6 +632,9 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   private readonly attachmentCache: AttachmentCache;
   /** Expires cached attachments on a bridge that is up but not being asked anything. */
   private attachmentSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Sweeps the machine store's ends (`--machine-secrets`); null until connect(). */
+  private secretSweepTimer: ReturnType<typeof setInterval> | null = null;
+  private readonly secretsSweepMs: number;
   private readonly keepAttachments: boolean;
   /** Whether the operator permitted the server to select `native`. */
   private readonly allowNative: boolean;
@@ -753,8 +761,13 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     this.spaceFiles = new SpaceFiles(this.allowedRootPaths, this.servedFiles);
     this.allowNative = options.allowNative ?? false;
     this.webSearch = options.webSearch ?? false;
+    this.secretsSweepMs = options.secretsSweepMs ?? MACHINE_SECRETS_SWEEP_MS;
     this.machineSecrets = options.machineSecrets
-      ? new MachineSecrets(options.secretsDir ? { store: new MachineSecretStore(options.secretsDir) } : {})
+      ? new MachineSecrets({
+        store: new MachineSecretStore(options.secretsDir ?? defaultSecretsDir(), {
+          onEnd: (record) => log.info('Machine secret ended', { name: record.name, kind: record.kind }),
+        }),
+      })
       : null;
     this.upstream = options.mcpUpstreams && Object.keys(options.mcpUpstreams).length
       ? new UpstreamHub(options.mcpUpstreams, {
@@ -1084,7 +1097,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
    * on every path. The value is never logged and never in the answer.
    */
   private async handleSecret(
-    message: SecretListMessage | SecretPutMessage | SecretDescribeMessage | SecretRemoveMessage,
+    message: SecretListMessage | SecretPutMessage | SecretSetEndMessage | SecretDescribeMessage | SecretRemoveMessage,
   ): Promise<void> {
     const id = typeof message.id === 'string' ? message.id : '';
     if (!id) return;
@@ -1100,15 +1113,19 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
     try {
       if (message.type === 'secret_list') {
-        const rows = await secrets.list();
+        const { secrets: rows, ended } = await secrets.list();
         log.info('Machine secrets listed', { count: rows.length });
-        this.send({ type: 'secret_result', id, ok: true, secrets: rows });
+        this.send({ type: 'secret_result', id, ok: true, secrets: rows, ended });
       } else if (message.type === 'secret_put') {
         const { replaced } = await secrets.put(message.name, message.value, {
-          replace: message.replace, description: message.description,
+          replace: message.replace, description: message.description, endsAt: message.ends_at, endKind: message.end_kind,
         });
-        log.info('Machine secret put', { name, replaced });
+        log.info('Machine secret put', { name, replaced, ...(message.ends_at ? { ends: message.end_kind } : {}) });
         this.send({ type: 'secret_result', id, ok: true, replaced });
+      } else if (message.type === 'secret_set_end') {
+        await secrets.setEnd(message.name, message.ends_at, message.end_kind);
+        log.info('Machine secret end set', { name, ends: message.ends_at === null ? 'none' : message.end_kind });
+        this.send({ type: 'secret_result', id, ok: true });
       } else if (message.type === 'secret_describe') {
         await secrets.describe(message.name, message.description);
         log.info('Machine secret described', { name });
@@ -1362,6 +1379,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     }
 
     this.startAttachmentSweeps();
+    this.startSecretSweeps();
     // Once per process, like the sweeps: reconnects to the server come through
     // here too, and the upstream connections outlive them. Started in the
     // background; their tools join the bridge's own as each one comes up.
@@ -1406,6 +1424,24 @@ export class Bridge extends EventEmitter<BridgeEvents> {
   }
 
   /**
+   * Handle the machine store's passed ends now, and every minute after that
+   * (`--machine-secrets` only). On start because an end may have passed while
+   * the bridge was not running; on a timer so a secret ends on time even when
+   * nobody reads the store. Every read sweeps as well. Once per process.
+   */
+  private startSecretSweeps(): void {
+    if (this.secretSweepTimer !== null || !this.machineSecrets) return;
+    const sweep = (): void => {
+      this.machineSecrets?.sweep().catch((err: unknown) => {
+        log.warn('Machine secrets sweep failed', { code: err instanceof SecretRefusal ? err.code : 'failed' });
+      });
+    };
+    sweep();
+    this.secretSweepTimer = setInterval(sweep, this.secretsSweepMs);
+    this.secretSweepTimer.unref();
+  }
+
+  /**
    * Gracefully disconnect from the server.
    */
   async disconnect(): Promise<void> {
@@ -1413,6 +1449,10 @@ export class Bridge extends EventEmitter<BridgeEvents> {
     if (this.attachmentSweepTimer !== null) {
       clearInterval(this.attachmentSweepTimer);
       this.attachmentSweepTimer = null;
+    }
+    if (this.secretSweepTimer !== null) {
+      clearInterval(this.secretSweepTimer);
+      this.secretSweepTimer = null;
     }
     this.stopHeartbeat();
     this.clearReconnectTimer();
@@ -1601,6 +1641,7 @@ export class Bridge extends EventEmitter<BridgeEvents> {
         break;
       case 'secret_list':
       case 'secret_put':
+      case 'secret_set_end':
       case 'secret_describe':
       case 'secret_remove':
         void this.handleSecret(message);

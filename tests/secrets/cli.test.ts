@@ -118,4 +118,50 @@ describe('aib secret', () => {
     expect(r.out).not.toContain(VALUE);
     expect(aib(['list']).out).toMatch(/^gh .*GitHub$/m);
   });
+
+  it('add --ends-in/--ends-at/--delete-at-end sets an end, list shows it, end changes and removes it', () => {
+    expect(aib(['add', 'k', '--ends-in', '2d', '--description', 'temp'], VALUE).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^k\s+\S+ \S+\s+ends \d{4}-\d\d-\d\d \d\d:\d\d:\d\d \(expires then\)\s+temp$/m);
+    expect(aib(['add', 'd', '--ends-at', '2030-01-01T00:00:00+01:00', '--delete-at-end'], VALUE).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^d\s+.*ends 2029-12-31 23:00:00 \(deleted then\)$/m);
+    expect(aib(['end', 'k', '--at', '2030-06-01T12:00:00Z', '--delete-at-end']).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^k\s+.*ends 2030-06-01 12:00:00 \(deleted then\)\s+temp$/m);
+    expect(aib(['end', 'k', '--none']).code).toBe(0);
+    expect(aib(['list']).out).not.toMatch(/^k .*ends/m);
+    for (const bad of [
+      ['add', 'x', '--ends-in', '2y'], ['add', 'x', '--delete-at-end'], ['add', 'x', '--ends-in', '1h', '--ends-at', '2030-01-01T00:00:00Z'],
+      ['add', 'x', '--ends-at', '2030-01-01T00:00:00'], ['add', 'x', '--ends-at', '2099-01-01T00:00:00Z'], ['add', 'x', '--ends-at', '2001-01-01T00:00:00Z'],
+    ]) {
+      const r = aib(bad, VALUE);
+      expect(r.code, bad.join(' ')).toBe(1);
+    }
+    expect(existsSync(join(home, '.ai-bridge', 'secrets', 'x'))).toBe(false);
+    expect(aib(['end', 'k']).code).toBe(1);
+    expect(aib(['end', 'k', '--none', '--expire']).code).toBe(1);
+    expect(aib(['end', 'k', '--in', '1h', '--expire', '--delete-at-end']).code).toBe(1);
+    expect(aib(['end', 'nope', '--in', '1h']).code).toBe(2);
+  });
+
+  it('run and path refuse an expired secret with their own exit code; list shows it as expired; --replace renews it', () => {
+    const dir = join(home, '.ai-bridge', 'secrets');
+    aib(['add', 'k', '--description', 'OpenAI'], VALUE);
+    const past = `${new Date(Date.now() - 3_600_000).toISOString().slice(0, 19)}Z`;
+    const shown = past.slice(0, 19).replace('T', ' ');
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')) as { secrets: Record<string, Record<string, unknown>> };
+    index.secrets['k'] = { ...index.secrets['k'], ends_at: past, end_kind: 'expire' };
+    writeFileSync(join(dir, 'index.json'), JSON.stringify(index));
+    const run = aib(['run', 'k', '--', 'sh', '-c', 'cat "$SECRET_FILE"']);
+    expect(run.code).toBe(4);
+    expect(run.err).toContain(`The secret "k" expired at ${past} and can no longer be used. Ask the person to renew it with the secret card.`);
+    expect(run.out).not.toContain(VALUE);
+    expect(existsSync(join(dir, 'k'))).toBe(false);
+    expect(aib(['path', 'k']).code).toBe(4);
+    const list = aib(['list']);
+    expect(list.out).toMatch(new RegExp(`^k\\s+.*expired ${shown}\\s+OpenAI$`, 'm'));
+    expect(list.err).toContain(`Ended: k expired at ${shown}.`);
+    expect(aib(['add', 'k'], 'renewed-value').code).toBe(1);
+    expect(aib(['end', 'k', '--none']).code).toBe(1);
+    expect(aib(['add', 'k', '--replace'], 'renewed-value').code).toBe(0);
+    expect(aib(['run', 'k', '--no-mask', '--', 'sh', '-c', 'cat "$SECRET_FILE"']).out).toBe('renewed-value');
+  });
 });
