@@ -164,4 +164,18 @@ describe('aib secret', () => {
     expect(aib(['add', 'k', '--replace'], 'renewed-value').code).toBe(0);
     expect(aib(['run', 'k', '--no-mask', '--', 'sh', '-c', 'cat "$SECRET_FILE"']).out).toBe('renewed-value');
   });
+
+  it('end without a kind flag keeps the kind a secret already has, and uses expire when it had no end', () => {
+    aib(['add', 'del', '--ends-in', '1h', '--delete-at-end'], VALUE);
+    expect(aib(['end', 'del', '--in', '2d']).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^del\s+.*\(deleted then\)$/m);
+    expect(aib(['end', 'del', '--at', '2030-06-01T12:00:00Z']).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^del\s+.*ends 2030-06-01 12:00:00 \(deleted then\)$/m);
+    expect(aib(['end', 'del', '--in', '1d', '--expire']).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^del\s+.*\(expires then\)$/m);
+    aib(['add', 'plain'], VALUE);
+    expect(aib(['end', 'plain', '--in', '2d']).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^plain\s+.*\(expires then\)$/m);
+  });
 });
+

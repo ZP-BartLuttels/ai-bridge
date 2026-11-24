@@ -580,7 +580,8 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   "The secret "x" expired at ... and can no longer be used"). `add --replace`
   renews it. With `--delete-at-end` the secret and its name are removed
   altogether. An end is at most 10 years ahead and must be in the future;
-  `end` without a kind sets `--expire`. The store checks the ends before
+  `end` without a kind keeps the kind the secret already has, and sets
+  `--expire` when it had no end. The store checks the ends before
   every command and the bridge (with `--machine-secrets`) also every minute,
   so an end that passed while nothing ran is handled at the next look.
   `list` names the ends of the last 30 days on stderr. A replace without an

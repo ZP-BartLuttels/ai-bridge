@@ -56,13 +56,15 @@ export function endAt(text: string): string {
 }
 
 /** The end and kind from `--in`/`--ends-in` or `--at`/`--ends-at` and the kind flags, or null for none. */
-function endFromFlags(inText: string | undefined, atText: string | undefined, kind: EndKind | undefined): { endsAt: string; endKind: EndKind } | null {
+function endFromFlags(
+  inText: string | undefined, atText: string | undefined, kind: EndKind | undefined, fallback: EndKind = 'expire',
+): { endsAt: string; endKind: EndKind } | null {
   if (inText !== undefined && atText !== undefined) throw new SecretRefusal('invalid_end', 'Give the end once: a duration or a time, not both.');
   if (inText === undefined && atText === undefined) {
     if (kind !== undefined) throw new SecretRefusal('invalid_end', 'What happens at the end needs an end: add a duration or a time.');
     return null;
   }
-  return { endsAt: inText !== undefined ? endIn(inText) : endAt(atText!), endKind: kind ?? 'expire' };
+  return { endsAt: inText !== undefined ? endIn(inText) : endAt(atText!), endKind: kind ?? fallback };
 }
 
 /** The end column of `aib secret list`: empty, `ends <time> (<kind>)` or `expired <time>`. */
@@ -260,7 +262,7 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
     .option('--at <time>', 'At this time, with a zone (2026-12-01T15:00:00Z)')
     .option('--none', 'Remove the end')
     .option('--delete-at-end', 'At the end delete it altogether')
-    .option('--expire', 'At the end only remove the value; the name stays, listed as expired (the default)')
+    .option('--expire', 'At the end only remove the value; the name stays, listed as expired (without a kind flag: the kind it has, else this)')
     .action(async (name: string, opts: { in?: string; at?: string; none?: boolean; deleteAtEnd?: boolean; expire?: boolean }) => {
       try {
         if (opts.deleteAtEnd && opts.expire) throw new SecretRefusal('invalid_end', 'Choose --delete-at-end or --expire, not both.');
@@ -273,9 +275,14 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
           console.log(`"${name}" no longer ends.`);
           return;
         }
-        const end = endFromFlags(opts.in, opts.at, kind);
+        const store = storeFor();
+        // Without a kind flag a secret that already ends keeps its kind: a "delete" secret is not turned into one that stays.
+        const current = kind === undefined && (opts.in !== undefined || opts.at !== undefined)
+          ? (await store.list()).find((r) => r.name === name)?.end_kind ?? undefined
+          : undefined;
+        const end = endFromFlags(opts.in, opts.at, kind, current ?? 'expire');
         if (!end) throw new SecretRefusal('invalid_end', 'Give --in, --at or --none.');
-        await storeFor().setEnd(name, end.endsAt, end.endKind);
+        await store.setEnd(name, end.endsAt, end.endKind);
         console.log(`"${name}" ${end.endKind === 'delete' ? 'is deleted' : 'expires'} at ${end.endsAt}.`);
       } catch (err) { fail(err); }
     });
