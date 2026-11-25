@@ -142,6 +142,9 @@ describe('an end that expires', () => {
     expect(existsSync(join(dir, 'new'))).toBe(false);
     expect(readFileSync(join(dir, 'k'), 'utf8')).toBe(VALUE);
     expect(readFileSync(join(dir, 'index.json'), 'utf8')).toBe(before);
+    // null with a kind is not "no end": both or neither, as on a first put.
+    expect((await refusal(store.put('k', 'other-value', { replace: true, endsAt: null, endKind: 'expire' }))).code).toBe('invalid_end');
+    expect(readFileSync(join(dir, 'index.json'), 'utf8')).toBe(before);
     // A first put keeps ends_at optional.
     expect(await store.put('first', VALUE)).toEqual({ replaced: false });
     await store.put('k', 'other-value', { replace: true, endsAt: null });
