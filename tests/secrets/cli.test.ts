@@ -238,5 +238,34 @@ describe('aib secret', { timeout: 30_000 }, () => {
     const plain = aib(['add', 'k', '--replace'], 'other-value-000');
     expect(plain.out).toMatch(/^Replaced "k" \(15 bytes\) in [^;]*\.$/m);
   });
+
+  it('import --replace keeps the end like add --replace, and refuses to keep an expired one', () => {
+    const src = join(home, 'folder');
+    mkdirSync(src);
+    writeFileSync(join(src, 'k'), 'other-value-123');
+    aib(['add', 'k', '--ends-in', '1w', '--delete-at-end'], VALUE);
+    const kept = aib(['import', src, '--replace']);
+    expect(kept.code).toBe(0);
+    expect(kept.out).toMatch(/^k: its end is kept: deleted \S+ \S+ UTC\.$/m);
+    expect(aib(['list']).out).toMatch(/^k\s+.*deleted \S+ \S+ UTC$/m);
+    const changed = aib(['import', src, '--replace', '--ends-at', '2031-01-01T00:00:00Z', '--expire']);
+    expect(changed.out).toMatch(/^k: its end is now: expires 2031-01-01 00:00:00 UTC\.$/m);
+    const removed = aib(['import', src, '--replace', '--no-end']);
+    expect(removed.out).toMatch(/^k: its end \(expires 2031-01-01 00:00:00 UTC\) is removed\.$/m);
+    expect(aib(['list']).out).not.toMatch(/^k .*(expires|deleted) /m);
+    expect(aib(['import', src, '--no-end', '--ends-in', '1d']).err).toContain('--no-end removes the end');
+    expect(aib(['import', src, '--delete-at-end']).err).toContain('What happens at the end needs an end');
+    for (const r of [kept, changed, removed]) expect(r.out + r.err).not.toContain('other-value-123');
+    const dir = join(home, '.ai-bridge', 'secrets');
+    const past = `${new Date(Date.now() - 3_600_000).toISOString().slice(0, 19)}Z`;
+    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')) as { secrets: Record<string, Record<string, unknown>> };
+    index.secrets['k'] = { ...index.secrets['k'], ends_at: past, end_kind: 'expire' };
+    writeFileSync(join(dir, 'index.json'), JSON.stringify(index));
+    expect(aib(['run', 'k', '--', 'true']).code).toBe(4);
+    const expired = aib(['import', src, '--replace']);
+    expect(expired.out).toContain('Skipped k: "k" expired at');
+    expect(expired.out).toContain('so its end cannot be kept: renew it with --ends-in <duration> or --ends-at <time>, or --no-end for none.');
+    expect(existsSync(join(dir, 'k'))).toBe(false);
+  });
 });
 

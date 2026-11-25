@@ -562,7 +562,7 @@ aib secret end github_token --in 30d              # or --at <time>, or --none; -
 aib secret describe github_token "GitHub, repo scope"
 aib secret path github_token                      # the file, for a program that reads one
 aib secret remove github_token --yes
-aib secret import ~/old-secrets                   # a folder of one file per secret (+ .desc/<name>)
+aib secret import ~/old-secrets                   # a folder of one file per secret (+ .desc/<name>); --replace keeps ends
 aib secret run github_token --env GH_TOKEN -- gh repo list
 ```
 
@@ -597,6 +597,12 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   (with `--machine-secrets`) also every minute. Without a running bridge the
   file of an ended secret stays until the next `aib secret` command, though
   nothing in `aib secret` hands it out.
+- **An end stops new uses; it does not take back a value already handed
+  out.** A command that `run` started before the end, or a program that read
+  the file `path` gave it, keeps the value it already has until it finishes:
+  the end removes the secret from the store, not from a running process. For
+  a short-lived secret, choose an end that leaves room for the work to finish,
+  and stop the command yourself if it must not run past the end.
 - **`run <name> [--env VAR] [--dotenv] [--no-mask] -- <command...>`** starts the
   command with `SECRET_FILE` (the secret's path) and `SECRET_NAME` set.
   `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every
@@ -633,8 +639,13 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
 - **`import <folder>`** copies every regular file whose name is a valid secret
   name, with a description from `<folder>/.desc/<name>` when there is one.
   Dot files are skipped, so is anything that is not a regular file; an
-  existing name is skipped unless `--replace`. It prints which names it
-  imported and skipped, never a value, and leaves the folder as it was.
+  existing name is skipped unless `--replace`. `--replace` keeps the end of
+  each secret it overwrites, exactly as `add --replace` does, and prints a
+  line per secret with an end ("name: its end is kept: expires ... UTC");
+  `--ends-in`, `--ends-at`, `--delete-at-end`, `--expire` and `--no-end` work
+  as on `add` and apply to every secret it imports. An expired secret is
+  skipped unless one of those is given. It prints which names it imported and
+  skipped, never a value, and leaves the folder as it was.
 - **Names:** letters and digits first, then letters, digits, `.`, `_`, `-`; at
   most 64 characters; not `index.json`; not differing from an existing name
   only in case.
