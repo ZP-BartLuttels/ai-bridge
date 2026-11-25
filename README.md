@@ -552,12 +552,12 @@ secret's description, when it was written and when it ends, if it does. Your own
 `aib secret` works on the store either way:
 
 ```bash
-aib secret list                                   # names, dates, descriptions; never a value
+aib secret list                                   # names, dates, ends, descriptions; never a value
 printf %s "$TOKEN" | aib secret add github_token --description "GitHub, read-only"
 aib secret add tls_key --from-file ./server.key   # the file as it is
-aib secret add github_token --replace < new.txt   # an existing name needs --replace
-aib secret add rpa_pass --ends-in 8h < pass.txt   # gone in 8 hours: m, h, d or w
-aib secret add temp --ends-at 2026-12-01T15:00:00Z --delete-at-end < t.txt
+aib secret add github_token --replace < new.txt   # an existing name needs --replace; its end is kept
+aib secret add rpa_pass --ends-in 8h < pass.txt   # expires in 8 hours (value removed, name stays); m, h, d or w
+aib secret add temp --ends-at 2026-12-01T15:00:00Z --delete-at-end < t.txt   # removed altogether at the end
 aib secret end github_token --in 30d              # or --at <time>, or --none; --delete-at-end | --expire
 aib secret describe github_token "GitHub, repo scope"
 aib secret path github_token                      # the file, for a program that reads one
@@ -574,18 +574,29 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
 - **No command prints a value.**
 - **A secret can end.** `--ends-in <n>(m|h|d|w)` or `--ends-at <time>` (a
   time with a zone, `Z` or `+01:00`; stored in UTC, whole seconds) on `add`,
-  or `aib secret end <name> (--in <n> | --at <time> | --none)` later. At the
-  end it **expires** by default: the value file is removed, the name stays in
-  `list` as `expired <time>`, and `run` and `path` refuse it (exit code 4,
-  "The secret "x" expired at ... and can no longer be used"). `add --replace`
-  renews it. With `--delete-at-end` the secret and its name are removed
-  altogether. An end is at most 10 years ahead and must be in the future;
-  `end` without a kind keeps the kind the secret already has, and sets
-  `--expire` when it had no end. The store checks the ends before
-  every command and the bridge (with `--machine-secrets`) also every minute,
-  so an end that passed while nothing ran is handled at the next look.
-  `list` names the ends of the last 30 days on stderr. A replace without an
-  end clears the old one.
+  or `aib secret end <name> (--in <n> | --at <time> | --none)` later (`end`
+  also takes `--ends-in` and `--ends-at`). A duration on `add` counts from when
+  the value was entered. At the end it **expires** by default: the value file
+  is removed, the name stays in `list` as `expired <time>`, and `run` and
+  `path` refuse it (exit code 4, "The secret "x" expired at ... and can no
+  longer be used"). `add --replace` renews it. With `--delete-at-end` the
+  secret and its name are removed altogether. An end is at most 10 years
+  ahead and must be in the future; `end` without a kind keeps the kind the
+  secret already has, and sets `--expire` when it had no end; `end` with only
+  `--delete-at-end` or `--expire` keeps the time and changes the kind. `list`
+  shows every time in UTC and names the ends of the last 30 days on stderr.
+- **`add --replace` keeps the end** of a secret that has one and has not
+  ended, and says so ("its end is kept: expires ... UTC"). An end flag gives
+  it a new end (a duration without `--delete-at-end` or `--expire` keeps the
+  kind it had), and `--no-end` removes it. Renewing an expired secret needs
+  `--ends-in`, `--ends-at` or `--no-end`: its old moment has passed, so it is
+  refused before the value is asked for.
+- **When an end is enforced.** `run` and `path` refuse a secret from the
+  second its end passes, with or without a bridge. The value file itself goes
+  at the next sweep: the store sweeps before every command, and the bridge
+  (with `--machine-secrets`) also every minute. Without a running bridge the
+  file of an ended secret stays until the next `aib secret` command, though
+  nothing in `aib secret` hands it out.
 - **`run <name> [--env VAR] [--dotenv] [--no-mask] -- <command...>`** starts the
   command with `SECRET_FILE` (the secret's path) and `SECRET_NAME` set.
   `--env VAR` also puts the content, trimmed, in `VAR`; `--dotenv` sets every

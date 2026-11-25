@@ -170,10 +170,16 @@ describe('the store', () => {
     expect((await refusal(store.read('link1'))).code).toBe('store_unavailable');
   });
 
-  it('a damaged index loses descriptions, never secrets', async () => {
+  it('refuses a damaged index instead of reading it as empty, and leaves it as it is', async () => {
     await store.put('k', VALUE, { description: 'd' });
-    writeFileSync(join(dir, 'index.json'), '{not json');
-    expect(await store.list()).toMatchObject([{ name: 'k', description: null }]);
+    for (const text of ['{not json', '[]', '{"secrets": []}', 'null']) {
+      writeFileSync(join(dir, 'index.json'), text);
+      for (const op of [() => store.list(), () => store.path('k'), () => store.put('x', VALUE), () => store.setEnd('k', null)]) {
+        expect((await refusal(op())).code, text).toBe('store_unavailable');
+      }
+      expect(readFileSync(join(dir, 'index.json'), 'utf8')).toBe(text);
+    }
+    expect(existsSync(join(dir, 'x'))).toBe(false);
   });
 });
 

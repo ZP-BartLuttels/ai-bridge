@@ -5,13 +5,17 @@
  * `~/.ai-bridge/secrets/` (0700), one file per secret named exactly like the
  * secret (0600 from the moment it exists), and `index.json` (0600) holding
  * each secret's description, when it was last written and its end, if any.
- * The folder is the truth about which secrets exist; the index only adds
- * words and dates, and keeps an expired secret's entry after its file is gone.
+ * The folder is the truth about which secrets exist; the index adds words
+ * and dates, and the ends that stop a secret, and keeps an expired secret's
+ * entry after its file is gone. Because it holds the ends, an index that
+ * exists but cannot be read is refused (`store_unavailable`), never read as empty.
  *
  * An end (`ends_at`, `end_kind`) is enforced by `sweep()`, which runs before
  * every read: `expire` removes the value file and keeps the entry with
  * `expired_at`, `delete` removes both. Each end handled leaves an ended record
- * (name, kind, time; never a value) for 30 days, at most 100 of them.
+ * (name, kind, time; never a value) for 30 days, at most 100 of them. The
+ * index records an end before the value file is removed, so an interrupted
+ * sweep leaves an entry marked ended whose file the next sweep removes.
  *
  * What this module promises about a value:
  *   - it is written with mode 0600 from creation: a temp file opened
@@ -264,7 +268,7 @@ export class MachineSecretStore {
   async sweep(now: Date = this.now()): Promise<EndedRecord[]> {
     if (!(await this.checkDir(false))) return [];
     const { secrets } = await this.readIndex();
-    if (!Object.values(secrets).some((entry) => isDue(entry, now))) return [];
+    if (!Object.values(secrets).some((entry) => isDue(entry, now)) && !(await this.leftovers(secrets)).length) return [];
     return this.locked(() => this.sweepLocked(now));
   }
 
@@ -313,10 +317,6 @@ export class MachineSecretStore {
 
   /**
    * Add a secret, or replace one when `replace` is true. An existing name is
-   * refused with `exists` before anything is written.
-   */
-  /**
-   * Add a secret, or replace one when `replace` is true. An existing name is
    * refused with `exists` before anything is written; an expired one counts
    * as existing, and replacing it renews it. The end is the one given, or
    * none: a replace without one clears the old end.
@@ -342,27 +342,37 @@ export class MachineSecretStore {
     return this.locked(async () => {
       await this.sweepLocked(this.now());
       const target = join(this.dir, checkedName);
-      const before = (await this.readIndex()).secrets[checkedName] ?? {};
-      const existed = (await this.existingFile(target)) || typeof before.expired_at === 'string';
+      const index = await this.readIndex();
+      const before = index.secrets[checkedName] ?? {};
+      const hadFile = await this.existingFile(target);
+      const existed = hadFile || typeof before.expired_at === 'string';
       if (existed && options.replace !== true) {
-        throw new SecretRefusal('exists', `A secret called "${checkedName}" already exists; replace it deliberately.`);
+        throw typeof before.expired_at === 'string'
+          ? new SecretRefusal('exists', `"${checkedName}" expired at ${before.expired_at}; replace it to renew it.`)
+          : new SecretRefusal('exists', `A secret called "${checkedName}" already exists; replace it deliberately.`);
       }
       // `Foo` beside `foo` is one file on a case-insensitive disk, where a
       // replace of `Foo` would overwrite `foo`: refused either way.
-      const names = [...await readdir(this.dir), ...Object.keys((await this.readIndex()).secrets)];
+      const expiredNames = Object.entries(index.secrets).filter(([, e]) => typeof e.expired_at === 'string').map(([n]) => n);
+      const names = [...await readdir(this.dir), ...expiredNames];
       if (!names.includes(checkedName)) {
         const twin = names.find((n) => n.toLowerCase() === checkedName.toLowerCase());
         if (twin) throw new SecretRefusal('exists', `"${checkedName}" differs from the existing "${twin}" only in case; pick another name.`);
       }
       await this.writeAtomic(target, bytes);
-      const index = await this.readIndex();
       index.secrets[checkedName] = {
         // A replace without a description keeps the one it had.
         description: description ?? (existed ? before.description ?? null : null),
-        updated_at: new Date().toISOString(),
+        updated_at: this.now().toISOString(),
         ...(end ?? {}),
       };
-      await this.writeIndex(index);
+      try {
+        await this.writeIndex(index);
+      } catch (err) {
+        // A new value must not stay behind without its end; a replace keeps its old index entry.
+        if (!hadFile) await unlink(target).catch(() => undefined);
+        throw err;
+      }
       return { replaced: existed };
     });
   }
@@ -383,7 +393,7 @@ export class MachineSecretStore {
       await this.sweepLocked(this.now());
       const index = await this.readIndex();
       const entry = index.secrets[checkedName];
-      if (typeof entry?.expired_at === 'string') throw this.ended(checkedName);
+      if (typeof entry?.expired_at === 'string') throw this.alreadyExpired(checkedName);
       if (!(await this.existingFile(join(this.dir, checkedName)))) throw this.notFound(checkedName);
       const next: IndexEntry = { ...(entry ?? {}) };
       delete next.ends_at;
@@ -436,7 +446,7 @@ export class MachineSecretStore {
     if (typeof expiredAt === 'string') {
       throw new SecretRefusal(
         'expired',
-        `The secret "${checkedName}" expired at ${expiredAt} and can no longer be used. Ask the person to renew it with the secret card.`,
+        `The secret "${checkedName}" expired at ${expiredAt} and can no longer be used. Ask the person to renew it with the secret card. On this machine: aib secret add ${checkedName} --replace.`,
       );
     }
     const target = join(this.dir, checkedName);
@@ -453,7 +463,9 @@ export class MachineSecretStore {
     let fh: FileHandle;
     try {
       fh = await open(target, constants.O_RDONLY | constants.O_NOFOLLOW);
-    } catch {
+    } catch (err) {
+      // An end that passed between the check and the open: say expired or not found, as path() does.
+      if (errno(err) === 'ENOENT') await this.path(name);
       throw new SecretRefusal('store_unavailable', `The secret "${String(name)}" cannot be opened.`);
     }
     try {
@@ -514,8 +526,11 @@ export class MachineSecretStore {
     return new SecretRefusal('not_found', `No secret called "${name}".`);
   }
 
-  private ended(name: string): SecretRefusal {
-    return new SecretRefusal('ended', `The secret "${name}" has already expired; replace it to renew it.`);
+  private alreadyExpired(name: string): SecretRefusal {
+    return new SecretRefusal(
+      'ended',
+      `The secret "${name}" has already expired; replace it to renew it (on this machine: aib secret add ${name} --replace).`,
+    );
   }
 
   private row(name: string, entry: IndexEntry, mtime: string | null): SecretRow {
@@ -530,16 +545,34 @@ export class MachineSecretStore {
     };
   }
 
-  /** The sweep, with the lock held. Writes the index only when it ended something. */
+  /**
+   * The entries already marked ended (`expired_at`) that still need work: a
+   * value file left by an interrupted sweep, or a `delete` entry not yet removed.
+   */
+  private async leftovers(secrets: Record<string, IndexEntry>): Promise<string[]> {
+    const names: string[] = [];
+    for (const [name, entry] of Object.entries(secrets)) {
+      if (typeof entry.expired_at !== 'string') continue;
+      if (endKindOf(entry) === 'delete') { names.push(name); continue; }
+      const st = await lstat(join(this.dir, name)).catch(() => null);
+      if (st?.isFile()) names.push(name);
+    }
+    return names;
+  }
+
+  /**
+   * The sweep, with the lock held. First the index records every end that
+   * passed (marked `expired_at`, plus its ended record), then the value files
+   * go and `delete` entries are removed. Writes the index only when it changed.
+   */
   private async sweepLocked(now: Date): Promise<EndedRecord[]> {
     const index = await this.readIndex();
     const done: EndedRecord[] = [];
     let changed = false;
     for (const [name, entry] of Object.entries(index.secrets)) {
       if (!isDue(entry, now)) continue;
-      const target = join(this.dir, name);
       let st: Stats | null = null;
-      try { st = await lstat(target); } catch { /* no file */ }
+      try { st = await lstat(join(this.dir, name)); } catch { /* no file */ }
       if (st && !st.isFile()) continue; // path() refuses it as store_unavailable
       changed = true;
       if (!st) {
@@ -547,16 +580,23 @@ export class MachineSecretStore {
         delete index.secrets[name];
         continue;
       }
-      await unlink(target);
-      const kind = endKindOf(entry);
       const endedAt = entry.ends_at as string;
-      if (kind === 'delete') delete index.secrets[name];
-      else index.secrets[name] = { ...entry, expired_at: endedAt };
-      done.push({ name, kind, ended_at: endedAt });
+      index.secrets[name] = { ...entry, expired_at: endedAt };
+      done.push({ name, kind: endKindOf(entry), ended_at: endedAt });
     }
-    if (!changed) return [];
-    index.ended = keptEnded([...index.ended, ...done], now);
-    await this.writeIndex(index);
+    if (done.length) index.ended = keptEnded([...index.ended, ...done], now);
+    if (changed) await this.writeIndex(index);
+    let removed = false;
+    for (const name of await this.leftovers(index.secrets)) {
+      const target = join(this.dir, name);
+      const st = await lstat(target).catch(() => null);
+      if (st?.isFile()) await unlink(target);
+      if (endKindOf(index.secrets[name]!) === 'delete') {
+        delete index.secrets[name];
+        removed = true;
+      }
+    }
+    if (removed) await this.writeIndex(index);
     for (const record of done) this.onEnd?.(record);
     return done;
   }
@@ -589,29 +629,38 @@ export class MachineSecretStore {
     let text: string;
     try {
       text = await readFile(join(this.dir, INDEX_FILE), 'utf8');
-    } catch {
-      return out;
+    } catch (err) {
+      if (errno(err) === 'ENOENT') return out;
+      throw this.damagedIndex();
     }
+    let parsed: { secrets?: unknown; ended?: unknown };
     try {
-      const parsed = JSON.parse(text) as { secrets?: unknown; ended?: unknown };
-      const secrets = parsed?.secrets;
-      if (typeof secrets === 'object' && secrets !== null && !Array.isArray(secrets)) {
-        for (const [name, entry] of Object.entries(secrets as Record<string, unknown>)) {
-          if (isValidName(name) && typeof entry === 'object' && entry !== null) out.secrets[name] = entry as IndexEntry;
-        }
-      }
-      if (Array.isArray(parsed?.ended)) {
-        for (const r of parsed.ended as Array<Partial<EndedRecord> | null>) {
-          if (r && isValidName(r.name) && (r.kind === 'expire' || r.kind === 'delete')
-            && typeof r.ended_at === 'string' && Number.isFinite(Date.parse(r.ended_at))) {
-            out.ended.push({ name: r.name, kind: r.kind, ended_at: r.ended_at });
-          }
-        }
-      }
+      parsed = JSON.parse(text) as { secrets?: unknown; ended?: unknown };
     } catch {
-      // A damaged index loses descriptions, never secrets: the folder is the truth.
+      throw this.damagedIndex();
+    }
+    // The index holds the ends: one that cannot be read must not let every secret go endless.
+    const isObject = (v: unknown): boolean => typeof v === 'object' && v !== null && !Array.isArray(v);
+    if (!isObject(parsed) || (parsed.secrets !== undefined && !isObject(parsed.secrets))) throw this.damagedIndex();
+    for (const [name, entry] of Object.entries((parsed.secrets ?? {}) as Record<string, unknown>)) {
+      if (isValidName(name) && typeof entry === 'object' && entry !== null) out.secrets[name] = entry as IndexEntry;
+    }
+    if (Array.isArray(parsed.ended)) {
+      for (const r of parsed.ended as Array<Partial<EndedRecord> | null>) {
+        if (r && isValidName(r.name) && (r.kind === 'expire' || r.kind === 'delete')
+          && typeof r.ended_at === 'string' && Number.isFinite(Date.parse(r.ended_at))) {
+          out.ended.push({ name: r.name, kind: r.kind, ended_at: r.ended_at });
+        }
+      }
     }
     return out;
+  }
+
+  private damagedIndex(): SecretRefusal {
+    return new SecretRefusal(
+      'store_unavailable',
+      `The index ${join(this.dir, INDEX_FILE)} cannot be read; no secret is used until it is fixed or removed by hand (removing it drops every description and end).`,
+    );
   }
 
   private async writeIndex(index: IndexFile): Promise<void> {

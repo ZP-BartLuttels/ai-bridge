@@ -211,7 +211,8 @@ describe('secrets with an end (revision 3)', () => {
     await connect(true, 50);
     expect(await ask({ type: 'secret_put', name: 'k', value: VALUE, ends_at: soon(1500), end_kind: 'delete' })).toMatchObject({ ok: true });
     const readIndex = () => JSON.parse(readFileSync(join(secretsDir(), 'index.json'), 'utf8')) as { secrets: object; ended?: unknown[] };
-    await until(() => readIndex().ended !== undefined, 'the timed sweep');
+    // The record is written first, the file and the entry go after it.
+    await until(() => readIndex().ended !== undefined && Object.keys(readIndex().secrets).length === 0, 'the timed sweep');
     const index = readIndex();
     expect(existsSync(join(secretsDir(), 'k'))).toBe(false);
     expect(index.secrets).toEqual({});

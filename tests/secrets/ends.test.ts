@@ -96,14 +96,29 @@ describe('an end that expires', () => {
     advance(HOUR);
     const err = await refusal(store.read('k'));
     expect(err.code).toBe('expired');
-    expect(err.message).toBe('The secret "k" expired at 2026-11-24T13:00:00Z and can no longer be used. Ask the person to renew it with the secret card.');
+    expect(err.message).toBe('The secret "k" expired at 2026-11-24T13:00:00Z and can no longer be used. Ask the person to renew it with the secret card. On this machine: aib secret add k --replace.');
+  });
+
+  it('says expired, not cannot be opened, when the file goes between the check and the open', async () => {
+    await store.put('k', VALUE, { endsAt: later(HOUR), endKind: 'expire' });
+    const path = store.path.bind(store);
+    let calls = 0;
+    // The first check passes; then the end passes and another process sweeps before the open.
+    store.path = async (name: unknown) => {
+      const p = await path(name);
+      if (calls++ === 0) { advance(HOUR); await new MachineSecretStore(dir, { now: () => new Date(clock) }).sweep(); }
+      return p;
+    };
+    expect((await refusal(store.read('k'))).code).toBe('expired');
   });
 
   it('counts as existing: has is true, a put without replace is refused, a replace renews it with the new end or none', async () => {
     await store.put('k', VALUE, { description: 'kept', endsAt: later(HOUR), endKind: 'expire' });
     advance(HOUR);
     expect(await store.has('k')).toBe(true);
-    expect((await refusal(store.put('k', 'new-value-1'))).code).toBe('exists');
+    const taken = await refusal(store.put('k', 'new-value-1'));
+    expect(taken.code).toBe('exists');
+    expect(taken.message).toBe('"k" expired at 2026-11-24T13:00:00Z; replace it to renew it.');
     expect(await store.put('k', 'new-value-1', { replace: true })).toEqual({ replaced: true });
     expect(await store.list()).toMatchObject([{ name: 'k', description: 'kept', ends_at: null, end_kind: null, expired_at: null }]);
     expect(readFileSync(await store.path('k'), 'utf8')).toBe('new-value-1');
@@ -149,6 +164,8 @@ describe('the sweep', () => {
       () => store.path('k').catch(() => undefined),
       () => store.put('other', VALUE, { replace: true }),
       () => store.describe('other', 'x'),
+      () => store.setEnd('other', null),
+      () => store.remove('other').then(() => store.put('other', VALUE)),
     ]) {
       await store.put('k', VALUE, { replace: true, endsAt: formatEnd(new Date(clock.getTime() + HOUR)), endKind: 'delete' });
       advance(HOUR);
@@ -165,6 +182,45 @@ describe('the sweep', () => {
     expect(await fresh.sweep()).toEqual([{ name: 'k', kind: 'expire', ended_at: '2026-11-24T13:00:00Z' }]);
     expect(await fresh.sweep()).toEqual([]);
     expect(index().ended).toHaveLength(1);
+  });
+
+  it('records the end before the value goes: an interrupted sweep keeps its record, and the next one removes the file', async () => {
+    for (const kind of ['expire', 'delete'] as const) {
+      await store.put(kind, VALUE, { endsAt: later(HOUR), endKind: kind });
+    }
+    advance(HOUR);
+    // What an interrupted sweep leaves: the index already says ended, the files are still there.
+    const file = index();
+    for (const name of ['expire', 'delete']) file.secrets[name] = { ...file.secrets[name], expired_at: '2026-11-24T13:00:00Z' };
+    writeFileSync(join(dir, 'index.json'), JSON.stringify({ ...file, ended: [
+      { name: 'expire', kind: 'expire', ended_at: '2026-11-24T13:00:00Z' }, { name: 'delete', kind: 'delete', ended_at: '2026-11-24T13:00:00Z' },
+    ] }));
+    expect((await refusal(store.path('expire'))).code).toBe('expired');
+    const { secrets, ended: records } = await store.listWithEnded();
+    expect(secrets).toMatchObject([{ name: 'expire', expired_at: '2026-11-24T13:00:00Z' }]);
+    expect(records.map((r) => r.name)).toEqual(['expire', 'delete']);
+    expect(existsSync(join(dir, 'expire'))).toBe(false);
+    expect(existsSync(join(dir, 'delete'))).toBe(false);
+    expect(Object.keys(index().secrets)).toEqual(['expire']);
+  });
+
+  it('never leaves a new value without its end when the index cannot be written', async () => {
+    await store.put('other', VALUE, { endsAt: later(HOUR), endKind: 'expire' });
+    // The disk fills up between the value and the index.
+    (store as unknown as { writeIndex: () => Promise<void> }).writeIndex = () => Promise.reject(new SecretRefusal('failed', 'disk full'));
+    expect((await refusal(store.put('other', 'new-value-1', { replace: true }))).code).toBe('failed');
+    expect((await store.list())[0]).toMatchObject({ name: 'other', ends_at: '2026-11-24T13:00:00Z' });
+    expect((await refusal(store.put('k', VALUE, { endsAt: later(HOUR), endKind: 'delete' }))).code).toBe('failed');
+    expect(existsSync(join(dir, 'k'))).toBe(false);
+  });
+
+  it('counts only existing files and expired names as case twins, not a stale entry of a file removed by hand', async () => {
+    await store.put('Foo', VALUE, { description: 'old' });
+    rmSync(join(dir, 'Foo'));
+    expect(await store.put('foo', VALUE)).toEqual({ replaced: false });
+    await store.put('Bar', VALUE, { endsAt: later(HOUR), endKind: 'expire' });
+    advance(HOUR);
+    expect((await refusal(store.put('bar', VALUE))).message).toContain('only in case');
   });
 
   it('drops the entry of a file removed by hand instead of reporting an end', async () => {
@@ -215,7 +271,9 @@ describe('setEnd', () => {
     expect((await refusal(store.setEnd('k', undefined))).code).toBe('invalid_end');
     advance(HOUR);
     expect((await refusal(store.setEnd('k', null))).code).toBe('ended');
-    expect((await refusal(store.setEnd('k', later(5 * HOUR), 'expire'))).code).toBe('ended');
+    const ended = await refusal(store.setEnd('k', later(5 * HOUR), 'expire'));
+    expect(ended.code).toBe('ended');
+    expect(ended.message).toContain('aib secret add k --replace');
   });
 
   it('refuses an end the put would set when it is invalid, before anything is written', async () => {

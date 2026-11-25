@@ -26,7 +26,8 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(home, { recursive: true, force: true }));
 
-describe('aib secret', () => {
+// Every case spawns the CLI a dozen times or more.
+describe('aib secret', { timeout: 30_000 }, () => {
   it('add reads stdin (less one trailing newline), refuses a taken name, replaces with --replace; nothing prints the value', async () => {
     const add = aib(['add', 'db', '--description', 'Postgres'], `${VALUE}\n`);
     expect(add.code).toBe(0);
@@ -39,7 +40,7 @@ describe('aib secret', () => {
     expect(aib(['add', 'db', '--replace'], 'other-value-123').code).toBe(0);
     expect(readFileSync(file, 'utf8')).toBe('other-value-123');
     const list = aib(['list']);
-    expect(list.out).toMatch(/^db\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\s+Postgres$/m);
+    expect(list.out).toMatch(/^db\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\s+Postgres$/m);
     for (const r of [add, again, list, aib(['path', 'db']), aib(['describe', 'db', 'new words'])]) {
       expect(r.out + r.err).not.toContain(VALUE);
       expect(r.out + r.err).not.toContain('other-value-123');
@@ -121,25 +122,38 @@ describe('aib secret', () => {
 
   it('add --ends-in/--ends-at/--delete-at-end sets an end, list shows it, end changes and removes it', () => {
     expect(aib(['add', 'k', '--ends-in', '2d', '--description', 'temp'], VALUE).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^k\s+\S+ \S+\s+ends \d{4}-\d\d-\d\d \d\d:\d\d:\d\d \(expires then\)\s+temp$/m);
-    expect(aib(['add', 'd', '--ends-at', '2030-01-01T00:00:00+01:00', '--delete-at-end'], VALUE).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^d\s+.*ends 2029-12-31 23:00:00 \(deleted then\)$/m);
+    expect(aib(['list']).out).toMatch(/^k\s+\S+ \S+ UTC\s+expires \d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\s+temp$/m);
+    const d = aib(['add', 'd', '--ends-at', '2030-01-01T00:00:00+01:00', '--delete-at-end'], VALUE);
+    expect(d.out).toMatch(/; it is deleted 2029-12-31 23:00:00 UTC\.$/m);
+    expect(aib(['list']).out).toMatch(/^d\s+.*deleted 2029-12-31 23:00:00 UTC$/m);
     expect(aib(['end', 'k', '--at', '2030-06-01T12:00:00Z', '--delete-at-end']).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^k\s+.*ends 2030-06-01 12:00:00 \(deleted then\)\s+temp$/m);
+    expect(aib(['list']).out).toMatch(/^k\s+.*deleted 2030-06-01 12:00:00 UTC\s+temp$/m);
     expect(aib(['end', 'k', '--none']).code).toBe(0);
-    expect(aib(['list']).out).not.toMatch(/^k .*ends/m);
-    for (const bad of [
-      ['add', 'x', '--ends-in', '2y'], ['add', 'x', '--delete-at-end'], ['add', 'x', '--ends-in', '1h', '--ends-at', '2030-01-01T00:00:00Z'],
-      ['add', 'x', '--ends-at', '2030-01-01T00:00:00'], ['add', 'x', '--ends-at', '2099-01-01T00:00:00Z'], ['add', 'x', '--ends-at', '2001-01-01T00:00:00Z'],
-    ]) {
-      const r = aib(bad, VALUE);
-      expect(r.code, bad.join(' ')).toBe(1);
-    }
-    expect(existsSync(join(home, '.ai-bridge', 'secrets', 'x'))).toBe(false);
-    expect(aib(['end', 'k']).code).toBe(1);
+    expect(aib(['list']).out).not.toMatch(/^k .*(expires|deleted) /m);
+    const none = aib(['end', 'k']);
+    expect(none.code).toBe(1);
+    expect(none.err).toContain('Give --in, --at or --none.');
     expect(aib(['end', 'k', '--none', '--expire']).code).toBe(1);
     expect(aib(['end', 'k', '--in', '1h', '--expire', '--delete-at-end']).code).toBe(1);
     expect(aib(['end', 'nope', '--in', '1h']).code).toBe(2);
+  });
+
+  it('refuses a bad end before the value is used, saying what is wrong', () => {
+    for (const [bad, why] of [
+      [['add', 'x', '--ends-in', '2y'], 'is not a duration'],
+      [['add', 'x', '--delete-at-end'], 'add --ends-in <duration> or --ends-at <time>'],
+      [['add', 'x', '--ends-in', '1h', '--ends-at', '2030-01-01T00:00:00Z'], 'not both'],
+      [['add', 'x', '--ends-at', '2030-01-01T00:00:00'], 'is not a time with a zone'],
+      [['add', 'x', '--ends-at', '2099-01-01T00:00:00Z'], 'at most 10 years ahead'],
+      [['add', 'x', '--ends-at', '2001-01-01T00:00:00Z'], 'must be in the future'],
+      [['add', 'x', '--no-end', '--ends-in', '1h'], '--no-end removes the end'],
+      [['add', 'x', '--expire', '--delete-at-end', '--ends-in', '1h'], 'not both'],
+    ] as const) {
+      const r = aib([...bad], VALUE);
+      expect(r.code, bad.join(' ')).toBe(1);
+      expect(r.err, bad.join(' ')).toContain(why);
+    }
+    expect(existsSync(join(home, '.ai-bridge', 'secrets', 'x'))).toBe(false);
   });
 
   it('run and path refuse an expired secret with their own exit code; list shows it as expired; --replace renews it', () => {
@@ -157,25 +171,72 @@ describe('aib secret', () => {
     expect(existsSync(join(dir, 'k'))).toBe(false);
     expect(aib(['path', 'k']).code).toBe(4);
     const list = aib(['list']);
-    expect(list.out).toMatch(new RegExp(`^k\\s+.*expired ${shown}\\s+OpenAI$`, 'm'));
-    expect(list.err).toContain(`Ended: k expired at ${shown}.`);
-    expect(aib(['add', 'k'], 'renewed-value').code).toBe(1);
-    expect(aib(['end', 'k', '--none']).code).toBe(1);
-    expect(aib(['add', 'k', '--replace'], 'renewed-value').code).toBe(0);
+    expect(list.out).toMatch(new RegExp(`^k\\s+.*expired ${shown} UTC\\s+OpenAI$`, 'm'));
+    expect(list.err).toContain(`Ended: k expired at ${shown} UTC.`);
+    expect(run.err).toContain('On this machine: aib secret add k --replace.');
+    const taken = aib(['add', 'k'], 'renewed-value');
+    expect(taken.code).toBe(1);
+    expect(taken.err).toContain(`"k" expired at ${shown} UTC; add --replace to renew it.`);
+    const ended = aib(['end', 'k', '--none']);
+    expect(ended.code).toBe(1);
+    expect(ended.err).toContain('aib secret add k --replace');
+    const noYes = aib(['remove', 'k']);
+    expect(noYes.code).toBe(1);
+    expect(noYes.err).toContain('run again with --yes');
+    // Its moment has passed, so it cannot be kept: refused before the value is read.
+    const keep = aib(['add', 'k', '--replace'], 'renewed-value');
+    expect(keep.code).toBe(1);
+    expect(keep.err).toContain('so its end cannot be kept: renew it with --ends-in <duration> or --ends-at <time>, or --no-end for none.');
+    expect(existsSync(join(dir, 'k'))).toBe(false);
+    const renew = aib(['add', 'k', '--replace', '--no-end'], 'renewed-value');
+    expect(renew.code).toBe(0);
+    expect(renew.out).toContain(`; its end (expired ${shown} UTC) is removed.`);
     expect(aib(['run', 'k', '--no-mask', '--', 'sh', '-c', 'cat "$SECRET_FILE"']).out).toBe('renewed-value');
   });
 
   it('end without a kind flag keeps the kind a secret already has, and uses expire when it had no end', () => {
     aib(['add', 'del', '--ends-in', '1h', '--delete-at-end'], VALUE);
     expect(aib(['end', 'del', '--in', '2d']).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^del\s+.*\(deleted then\)$/m);
+    expect(aib(['list']).out).toMatch(/^del\s+.*deleted \S+ \S+ UTC$/m);
     expect(aib(['end', 'del', '--at', '2030-06-01T12:00:00Z']).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^del\s+.*ends 2030-06-01 12:00:00 \(deleted then\)$/m);
+    expect(aib(['list']).out).toMatch(/^del\s+.*deleted 2030-06-01 12:00:00 UTC$/m);
     expect(aib(['end', 'del', '--in', '1d', '--expire']).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^del\s+.*\(expires then\)$/m);
+    expect(aib(['list']).out).toMatch(/^del\s+.*expires \S+ \S+ UTC$/m);
     aib(['add', 'plain'], VALUE);
     expect(aib(['end', 'plain', '--in', '2d']).code).toBe(0);
-    expect(aib(['list']).out).toMatch(/^plain\s+.*\(expires then\)$/m);
+    expect(aib(['list']).out).toMatch(/^plain\s+.*expires \S+ \S+ UTC$/m);
+  });
+
+  it('end takes --ends-in/--ends-at too, and a kind flag alone keeps the time', () => {
+    aib(['add', 'k'], VALUE);
+    expect(aib(['end', 'k', '--ends-at', '2030-06-01T12:00:00Z']).code).toBe(0);
+    const kind = aib(['end', 'k', '--delete-at-end']);
+    expect(kind.code).toBe(0);
+    expect(kind.out).toBe('"k" is deleted 2030-06-01 12:00:00 UTC.\n');
+    expect(aib(['end', 'k', '--ends-in', '2d']).code).toBe(0);
+    expect(aib(['list']).out).toMatch(/^k\s+.*deleted \S+ \S+ UTC$/m);
+    expect(aib(['end', 'k', '--in', '1d', '--ends-in', '2d']).err).toContain('Give --in or --ends-in once.');
+    aib(['add', 'plain'], VALUE);
+    const alone = aib(['end', 'plain', '--expire']);
+    expect(alone.code).toBe(1);
+    expect(alone.err).toContain('add --in <duration> or --at <time>.');
+  });
+
+  it('add --replace keeps the end, says so, and changes or removes it only when asked', () => {
+    aib(['add', 'k', '--ends-at', '2030-06-01T12:00:00Z', '--delete-at-end'], VALUE);
+    const kept = aib(['add', 'k', '--replace'], 'other-value-123');
+    expect(kept.code).toBe(0);
+    expect(kept.out).toMatch(/^Replaced "k" \(15 bytes\) in .*; its end is kept: deleted 2030-06-01 12:00:00 UTC\.$/m);
+    expect(aib(['list']).out).toMatch(/^k\s+.*deleted 2030-06-01 12:00:00 UTC$/m);
+    const changed = aib(['add', 'k', '--replace', '--ends-at', '2031-01-01T00:00:00Z'], 'other-value-456');
+    expect(changed.out).toMatch(/; its end is now: deleted 2031-01-01 00:00:00 UTC\.$/m);
+    const toExpire = aib(['add', 'k', '--replace', '--ends-at', '2031-01-01T00:00:00Z', '--expire'], 'other-value-456');
+    expect(toExpire.out).toMatch(/; its end is now: expires 2031-01-01 00:00:00 UTC\.$/m);
+    const removed = aib(['add', 'k', '--replace', '--no-end'], 'other-value-789');
+    expect(removed.out).toMatch(/; its end \(expires 2031-01-01 00:00:00 UTC\) is removed\.$/m);
+    expect(aib(['list']).out).not.toMatch(/^k .*(expires|deleted) /m);
+    const plain = aib(['add', 'k', '--replace'], 'other-value-000');
+    expect(plain.out).toMatch(/^Replaced "k" \(15 bytes\) in [^;]*\.$/m);
   });
 });
 
