@@ -462,7 +462,7 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
     .option('--ends-in <n>', 'End every imported secret after a while: a number and m, h, d or w (30m, 8h, 2d, 1w)')
     .option('--ends-at <time>', 'End every imported secret at this time, with a zone (2026-12-01T15:00:00Z)')
     .option('--delete-at-end', 'At the end delete them altogether (without this they expire)')
-    .option('--expire', 'At the end only remove the value (the default; on --replace it turns a deleting end into an expiring one)')
+    .option('--expire', 'At the end only remove the value (the default; with an end flag on --replace it turns a deleting end into an expiring one)')
     .option('--no-end', 'With --replace: remove the end each one has')
     .action(async (folder: string, opts: {
       replace?: boolean; endsIn?: string; endsAt?: string; deleteAtEnd?: boolean; expire?: boolean; end: boolean;

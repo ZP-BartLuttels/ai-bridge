@@ -641,7 +641,8 @@ aib secret run github_token --env GH_TOKEN -- gh repo list
   Dot files are skipped, so is anything that is not a regular file; an
   existing name is skipped unless `--replace`. `--replace` keeps the end of
   each secret it overwrites, exactly as `add --replace` does, and prints a
-  line per secret with an end ("name: its end is kept: expires ... UTC");
+  line per secret whose end it kept, changed or removed ("name: its end is
+  kept: expires ... UTC");
   `--ends-in`, `--ends-at`, `--delete-at-end`, `--expire` and `--no-end` work
   as on `add` and apply to every secret it imports. An expired secret is
   skipped unless one of those is given. It prints which names it imported and
