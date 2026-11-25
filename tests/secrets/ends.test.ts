@@ -72,16 +72,16 @@ describe('checkEnd', () => {
 
 describe('an end that expires', () => {
   it('removes the value at the end and keeps the name, listed with expired_at equal to ends_at', async () => {
-    await store.put('openai-key', VALUE, { description: 'OpenAI', endsAt: later(HOUR), endKind: 'expire' });
+    await store.put('api-key', VALUE, { description: 'Example API', endsAt: later(HOUR), endKind: 'expire' });
     expect(await store.list()).toEqual([{
-      name: 'openai-key', description: 'OpenAI', updated_at: expect.any(String),
+      name: 'api-key', description: 'Example API', updated_at: expect.any(String),
       ends_at: '2026-11-24T13:00:00Z', end_kind: 'expire', expired_at: null,
     }]);
     advance(2 * HOUR);
     const { secrets, ended: records } = await store.listWithEnded();
-    expect(secrets).toMatchObject([{ name: 'openai-key', description: 'OpenAI', expired_at: '2026-11-24T13:00:00Z' }]);
-    expect(records).toEqual([{ name: 'openai-key', kind: 'expire', ended_at: '2026-11-24T13:00:00Z' }]);
-    expect(existsSync(join(dir, 'openai-key'))).toBe(false);
+    expect(secrets).toMatchObject([{ name: 'api-key', description: 'Example API', expired_at: '2026-11-24T13:00:00Z' }]);
+    expect(records).toEqual([{ name: 'api-key', kind: 'expire', ended_at: '2026-11-24T13:00:00Z' }]);
+    expect(existsSync(join(dir, 'api-key'))).toBe(false);
     expect(ended).toEqual(records);
     expect(readFileSync(join(dir, 'index.json'), 'utf8')).not.toContain(VALUE);
   });
@@ -163,13 +163,13 @@ describe('an end that expires', () => {
 
 describe('an end that deletes', () => {
   it('removes the file and the entry, leaving only the ended record', async () => {
-    await store.put('rpa-pass', VALUE, { endsAt: later(HOUR), endKind: 'delete' });
+    await store.put('deploy-token', VALUE, { endsAt: later(HOUR), endKind: 'delete' });
     advance(HOUR);
-    expect(await store.has('rpa-pass')).toBe(false);
-    expect(existsSync(join(dir, 'rpa-pass'))).toBe(false);
+    expect(await store.has('deploy-token')).toBe(false);
+    expect(existsSync(join(dir, 'deploy-token'))).toBe(false);
     expect(index().secrets).toEqual({});
-    expect(await store.listWithEnded()).toEqual({ secrets: [], ended: [{ name: 'rpa-pass', kind: 'delete', ended_at: '2026-11-24T13:00:00Z' }] });
-    expect((await refusal(store.path('rpa-pass'))).code).toBe('not_found');
+    expect(await store.listWithEnded()).toEqual({ secrets: [], ended: [{ name: 'deploy-token', kind: 'delete', ended_at: '2026-11-24T13:00:00Z' }] });
+    expect((await refusal(store.path('deploy-token'))).code).toBe('not_found');
   });
 });
 

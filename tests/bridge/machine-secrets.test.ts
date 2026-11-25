@@ -167,22 +167,25 @@ describe('secrets with an end (revision 3)', () => {
 
   it('puts with an end, sets and removes it, and lists the ends; refuses bad ends and an unknown name', async () => {
     await connect(true);
-    expect(await ask({ type: 'secret_put', name: 'rpa-pass', value: VALUE, ends_at: soon(3_600_000), end_kind: 'delete' }))
+    expect(await ask({ type: 'secret_put', name: 'deploy-token', value: VALUE, ends_at: soon(3_600_000), end_kind: 'delete' }))
       .toMatchObject({ ok: true, replaced: false });
-    expect(await ask({ type: 'secret_put', name: 'openai-key', value: VALUE }))
+    expect(await ask({ type: 'secret_put', name: 'api-key', value: VALUE }))
       .toMatchObject({ ok: true });
     const listed = await ask({ type: 'secret_list' });
     expect(listed).toMatchObject({ ok: true, ended: [], secrets: [
-      { name: 'openai-key', ends_at: null, end_kind: null, expired_at: null },
-      { name: 'rpa-pass', ends_at: expect.stringMatching(/Z$/), end_kind: 'delete', expired_at: null },
+      { name: 'api-key', ends_at: null, end_kind: null, expired_at: null },
+      { name: 'deploy-token', ends_at: expect.stringMatching(/Z$/), end_kind: 'delete', expired_at: null },
     ] });
     const at = soon(7_200_000);
-    expect(await ask({ type: 'secret_set_end', name: 'openai-key', ends_at: at, end_kind: 'expire' })).toEqual({ type: 'secret_result', id: expect.any(String), ok: true });
-    expect(await ask({ type: 'secret_list' })).toMatchObject({ secrets: [{ name: 'openai-key', ends_at: at, end_kind: 'expire' }, { name: 'rpa-pass' }] });
-    expect(await ask({ type: 'secret_set_end', name: 'openai-key', ends_at: null })).toMatchObject({ ok: true });
-    expect(await ask({ type: 'secret_list' })).toMatchObject({ secrets: [{ name: 'openai-key', ends_at: null, end_kind: null }, { name: 'rpa-pass' }] });
+    expect(await ask({ type: 'secret_set_end', name: 'api-key', ends_at: at, end_kind: 'expire' })).toEqual({ type: 'secret_result', id: expect.any(String), ok: true });
+    expect(await ask({ type: 'secret_list' })).toMatchObject({ secrets: [{ name: 'api-key', ends_at: at, end_kind: 'expire' }, { name: 'deploy-token' }] });
+    expect(await ask({ type: 'secret_set_end', name: 'api-key', ends_at: null })).toMatchObject({ ok: true });
+    // A kind sent beside null (a server never does) is ignored: the end is removed.
+    await ask({ type: 'secret_set_end', name: 'api-key', ends_at: at, end_kind: 'delete' });
+    expect(await ask({ type: 'secret_set_end', name: 'api-key', ends_at: null, end_kind: 'delete' })).toMatchObject({ ok: true });
+    expect(await ask({ type: 'secret_list' })).toMatchObject({ secrets: [{ name: 'api-key', ends_at: null, end_kind: null }, { name: 'deploy-token' }] });
     expect(await ask({ type: 'secret_set_end', name: 'nope', ends_at: null })).toMatchObject({ ok: false, code: 'not_found' });
-    expect(await ask({ type: 'secret_set_end', name: 'openai-key', ends_at: '2020-01-01T00:00:00Z', end_kind: 'expire' }))
+    expect(await ask({ type: 'secret_set_end', name: 'api-key', ends_at: '2020-01-01T00:00:00Z', end_kind: 'expire' }))
       .toMatchObject({ ok: false, code: 'invalid_end' });
     expect(await ask({ type: 'secret_put', name: 'x1', value: VALUE, ends_at: soon(60_000) }))
       .toMatchObject({ ok: false, code: 'invalid_end' });

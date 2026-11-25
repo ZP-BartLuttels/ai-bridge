@@ -2663,7 +2663,7 @@ The person on the machine uses the same store with `aib secret ...` (README,
 |---|---|
 | `secret_list {id}` | lists the store: names, descriptions, dates, ends; and the ends handled recently |
 | `secret_put {id, name, value, description?, replace?, ends_at?, end_kind?}` | refuses an existing name with `exists` unless `replace` is `true` (an expired secret's name is taken too); then writes the value (a new file, mode 0600, renamed into place). A replace without `description` keeps the old one. **A replace must carry the `ends_at` key** (revision 3): a time with `end_kind`, or `null` for deliberately no end; without the key it is refused with `end_required` and nothing changes. The old end is never kept: the end is the one sent. A first put (no `replace`) may leave `ends_at` out (no end). A replace of an expired secret renews it |
-| `secret_set_end {id, name, ends_at, end_kind}` | revision 3: sets the end, or removes it with `ends_at: null`. `end_kind` is required with a time (without it: `invalid_end`) and omitted with `null` (ignored if sent). The bridge never keeps the old kind for a server; `aib secret end` does that on the machine, reading and writing under the store's lock, as a convenience of the command line. Leaves the value and the description alone |
+| `secret_set_end {id, name, ends_at, end_kind}` | revision 3: sets the end, or removes it with `ends_at: null`. `end_kind` is required when `ends_at` is a time (without it: `invalid_end`) and omitted with `ends_at: null`: a server never sends it there, and this bridge ignores one sent anyway. The bridge never keeps the old kind for a server; `aib secret end` does that on the machine, reading and writing under the store's lock, as a convenience of the command line. Leaves the value and the description alone |
 | `secret_describe {id, name, description}` | sets the description; `""` clears it (an expired secret's too) |
 | `secret_remove {id, name}` | deletes the secret and its description (an expired one too) |
 
@@ -2707,11 +2707,11 @@ A secret may carry an end: `ends_at` (ISO 8601 UTC, whole seconds, `Z`, e.g.
 `2026-12-01T15:00:00Z`) and `end_kind`, both or neither.
 
 ```json
-{"type": "secret_put", "id": "sec-1", "name": "rpa-pass", "value": "…", "replace": false, "ends_at": "2026-11-24T17:00:00Z", "end_kind": "delete"}
-{"type": "secret_put", "id": "sec-2", "name": "openai-key", "value": "…", "replace": true, "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
+{"type": "secret_put", "id": "sec-1", "name": "deploy-token", "value": "…", "replace": false, "ends_at": "2026-11-24T17:00:00Z", "end_kind": "delete"}
+{"type": "secret_put", "id": "sec-2", "name": "api-key", "value": "…", "replace": true, "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
 {"type": "secret_put", "id": "sec-3", "name": "build-token", "value": "…", "replace": true, "ends_at": null}
-{"type": "secret_set_end", "id": "sec-4", "name": "openai-key", "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
-{"type": "secret_set_end", "id": "sec-5", "name": "openai-key", "ends_at": null}
+{"type": "secret_set_end", "id": "sec-4", "name": "api-key", "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
+{"type": "secret_set_end", "id": "sec-5", "name": "api-key", "ends_at": null}
 ```
 
 - **A replace states its end.** A `secret_put` with `replace: true` must carry

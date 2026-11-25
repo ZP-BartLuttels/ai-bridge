@@ -162,7 +162,7 @@ describe('aib secret', { timeout: 30_000 }, () => {
 
   it('run and path refuse an expired secret with their own exit code; list shows it as expired; --replace renews it', () => {
     const dir = join(home, '.ai-bridge', 'secrets');
-    aib(['add', 'k', '--description', 'OpenAI'], VALUE);
+    aib(['add', 'k', '--description', 'Example API'], VALUE);
     const past = `${new Date(Date.now() - 3_600_000).toISOString().slice(0, 19)}Z`;
     const shown = past.slice(0, 19).replace('T', ' ');
     const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')) as { secrets: Record<string, Record<string, unknown>> };
@@ -175,7 +175,7 @@ describe('aib secret', { timeout: 30_000 }, () => {
     expect(existsSync(join(dir, 'k'))).toBe(false);
     expect(aib(['path', 'k']).code).toBe(4);
     const list = aib(['list']);
-    expect(list.out).toMatch(new RegExp(`^k\\s+.*expired ${shown} UTC\\s+OpenAI$`, 'm'));
+    expect(list.out).toMatch(new RegExp(`^k\\s+.*expired ${shown} UTC\\s+Example API$`, 'm'));
     expect(list.err).toContain(`Ended: k expired at ${shown} UTC.`);
     expect(run.err).toContain('On this machine: aib secret add k --replace with --ends-in, --ends-at or --no-end.');
     const taken = aib(['add', 'k'], 'renewed-value');

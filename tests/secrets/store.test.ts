@@ -187,32 +187,32 @@ describe('import', () => {
   it('copies one file per secret with .desc descriptions, skips dot files, refuses existing names unless --replace, and leaves the folder alone', async () => {
     const src = join(home, 'old-secrets');
     mkdirSync(join(src, '.desc'), { recursive: true });
-    writeFileSync(join(src, 'github_token'), VALUE);
+    writeFileSync(join(src, 'ci-token'), VALUE);
     writeFileSync(join(src, 'app.env'), 'API_KEY=abcdefghijkl\n');
     writeFileSync(join(src, '.hidden'), 'skip me');
     writeFileSync(join(src, 'bad name'), 'skip me too');
     mkdirSync(join(src, 'folder'));
-    writeFileSync(join(src, '.desc', 'github_token'), 'GitHub, read-only\n');
+    writeFileSync(join(src, '.desc', 'ci-token'), 'CI, read-only\n');
     await store.put('app.env', 'older-value-here');
 
     const report = await importFolder(store, src);
-    expect(report.imported).toEqual(['github_token']);
+    expect(report.imported).toEqual(['ci-token']);
     expect(report.skipped).toEqual([
       { name: 'app.env', reason: 'exists (use --replace)' },
       { name: 'bad name', reason: 'not a valid secret name' },
       { name: 'folder', reason: 'not a regular file' },
     ]);
     expect(JSON.stringify(report)).not.toContain(VALUE);
-    expect(readFileSync(join(dir, 'github_token'), 'utf8')).toBe(VALUE);
-    expect(statSync(join(dir, 'github_token')).mode & 0o777).toBe(0o600);
-    expect((await store.list()).find((r) => r.name === 'github_token')!.description).toBe('GitHub, read-only');
+    expect(readFileSync(join(dir, 'ci-token'), 'utf8')).toBe(VALUE);
+    expect(statSync(join(dir, 'ci-token')).mode & 0o777).toBe(0o600);
+    expect((await store.list()).find((r) => r.name === 'ci-token')!.description).toBe('CI, read-only');
     expect(readFileSync(join(dir, 'app.env'), 'utf8')).toBe('older-value-here');
 
     const again = await importFolder(store, src, { replace: true, end: { noEnd: true } });
-    expect(again.imported).toEqual(['app.env', 'github_token']);
+    expect(again.imported).toEqual(['app.env', 'ci-token']);
     expect(readFileSync(join(dir, 'app.env'), 'utf8')).toBe('API_KEY=abcdefghijkl\n');
-    expect(readdirSync(src).sort()).toEqual(['.desc', '.hidden', 'app.env', 'bad name', 'folder', 'github_token']);
-    expect(readFileSync(join(src, 'github_token'), 'utf8')).toBe(VALUE);
+    expect(readdirSync(src).sort()).toEqual(['.desc', '.hidden', 'app.env', 'bad name', 'ci-token', 'folder']);
+    expect(readFileSync(join(src, 'ci-token'), 'utf8')).toBe(VALUE);
   });
 
   it('--replace must state its end (end_required before anything is read), and writes the given end or none, never the old one', async () => {

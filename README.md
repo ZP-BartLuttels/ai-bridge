@@ -553,17 +553,17 @@ secret's description, when it was written and when it ends, if it does. Your own
 
 ```bash
 aib secret list                                   # names, dates, ends, descriptions; never a value
-printf %s "$TOKEN" | aib secret add github_token --description "GitHub, read-only"
+printf %s "$TOKEN" | aib secret add ci-token --description "CI, read-only"
 aib secret add tls_key --from-file ./server.key   # the file as it is
-aib secret add github_token --replace --ends-in 30d < new.txt   # --replace needs an end flag or --no-end
-aib secret add rpa_pass --ends-in 8h < pass.txt   # expires in 8 hours (value removed, name stays); m, h, d or w
+aib secret add ci-token --replace --ends-in 30d < new.txt   # --replace needs an end flag or --no-end
+aib secret add deploy-token --ends-in 8h < pass.txt   # expires in 8 hours (value removed, name stays); m, h, d or w
 aib secret add temp --ends-at 2026-12-01T15:00:00Z --delete-at-end < t.txt   # removed altogether at the end
-aib secret end github_token --in 30d              # or --at <time>, or --none; --delete-at-end | --expire
-aib secret describe github_token "GitHub, repo scope"
-aib secret path github_token                      # the file, for a program that reads one
-aib secret remove github_token --yes
+aib secret end ci-token --in 30d                  # or --at <time>, or --none; --delete-at-end | --expire
+aib secret describe ci-token "CI, repo scope"
+aib secret path ci-token                          # the file, for a program that reads one
+aib secret remove ci-token --yes
 aib secret import ~/old-secrets                   # a folder of one file per secret (+ .desc/<name>)
-aib secret run github_token --env GH_TOKEN -- gh repo list
+aib secret run ci-token --env GH_TOKEN -- gh repo list
 ```
 
 - **The value comes from stdin or `--from-file`, never an argument** (an
