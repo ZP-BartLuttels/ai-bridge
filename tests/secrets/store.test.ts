@@ -79,7 +79,7 @@ describe('the store', () => {
     const err = await refusal(store.put('k1', 'another-value'));
     expect(err.code).toBe('exists');
     expect(readFileSync(join(dir, 'k1'), 'utf8')).toBe(VALUE);
-    expect(await store.put('k1', 'another-value', { replace: true })).toEqual({ replaced: true });
+    expect(await store.put('k1', 'another-value', { replace: true, endsAt: null })).toEqual({ replaced: true });
     expect(readFileSync(join(dir, 'k1'), 'utf8')).toBe('another-value');
     expect((await store.list())[0]!.description).toBe('kept');
   });
@@ -130,7 +130,7 @@ describe('the store', () => {
 
   it('refuses a replace whose name matches an existing one only in case', async () => {
     await store.put('Token', VALUE);
-    expect((await refusal(store.put('token', 'other-value-1', { replace: true }))).message).toMatch(/only in case/);
+    expect((await refusal(store.put('token', 'other-value-1', { replace: true, endsAt: null }))).message).toMatch(/only in case/);
     expect(readFileSync(join(dir, 'Token'), 'utf8')).toBe(VALUE);
   });
 
@@ -208,31 +208,31 @@ describe('import', () => {
     expect((await store.list()).find((r) => r.name === 'github_token')!.description).toBe('GitHub, read-only');
     expect(readFileSync(join(dir, 'app.env'), 'utf8')).toBe('older-value-here');
 
-    const again = await importFolder(store, src, { replace: true });
+    const again = await importFolder(store, src, { replace: true, end: { noEnd: true } });
     expect(again.imported).toEqual(['app.env', 'github_token']);
     expect(readFileSync(join(dir, 'app.env'), 'utf8')).toBe('API_KEY=abcdefghijkl\n');
     expect(readdirSync(src).sort()).toEqual(['.desc', '.hidden', 'app.env', 'bad name', 'folder', 'github_token']);
     expect(readFileSync(join(src, 'github_token'), 'utf8')).toBe(VALUE);
   });
 
-  it('--replace keeps the end of a secret it overwrites and says so, like add --replace; an end flag or noEnd changes it', async () => {
+  it('--replace must state its end (end_required before anything is read), and writes the given end or none, never the old one', async () => {
     const src = join(home, 'old-secrets');
     mkdirSync(src);
     writeFileSync(join(src, 'api-key'), VALUE);
     await store.put('api-key', 'older-value-here', { endsAt: '2030-06-01T12:00:00Z', endKind: 'delete' });
 
-    const kept = await importFolder(store, src, { replace: true });
-    expect(kept.imported).toEqual(['api-key']);
-    expect(kept.ends).toEqual([{ name: 'api-key', words: 'its end is kept: deleted 2030-06-01 12:00:00 UTC' }]);
+    await expect(importFolder(store, src, { replace: true })).rejects.toMatchObject({ code: 'end_required' });
+    expect(readFileSync(join(dir, 'api-key'), 'utf8')).toBe('older-value-here');
     expect((await store.list())[0]).toMatchObject({ ends_at: '2030-06-01T12:00:00Z', end_kind: 'delete' });
-    expect(readFileSync(join(dir, 'api-key'), 'utf8')).toBe(VALUE);
 
     const changed = await importFolder(store, src, { replace: true, end: { endsAt: '2031-01-01T00:00:00Z' } });
-    expect(changed.ends).toEqual([{ name: 'api-key', words: 'its end is now: deleted 2031-01-01 00:00:00 UTC' }]);
+    expect(changed.imported).toEqual(['api-key']);
+    expect(changed.ends).toEqual([{ name: 'api-key', words: 'it expires 2031-01-01 00:00:00 UTC' }]);
+    expect(readFileSync(join(dir, 'api-key'), 'utf8')).toBe(VALUE);
 
     const removed = await importFolder(store, src, { replace: true, end: { noEnd: true } });
-    expect(removed.ends).toEqual([{ name: 'api-key', words: 'its end (deleted 2031-01-01 00:00:00 UTC) is removed' }]);
+    expect(removed.ends).toEqual([{ name: 'api-key', words: 'it has no end' }]);
     expect((await store.list())[0]).toMatchObject({ ends_at: null, end_kind: null });
-    expect(JSON.stringify([kept, changed, removed])).not.toContain(VALUE);
+    expect(JSON.stringify([changed, removed])).not.toContain(VALUE);
   });
 });

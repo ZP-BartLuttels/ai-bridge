@@ -109,6 +109,7 @@ Node 22 or newer (CI runs 22 and 24).
 - 0020 Machine secrets: a built-in store, managed by a server only with `--machine-secrets`.
 - 0021 Secrets a server wrote are treated like the person's own: no marker, no extra refusal in `run`.
 - 0022 A secrets store a turn could read is a startup warning only; prompt injection is outside the bridge's threat model.
+- 0023 Machine secrets may end (expire or delete), enforced on the machine; a replace must state its end (`end_required`); `index.json` is version 2.
 
 Full records and status: [docs/decisions/README.md](docs/decisions/README.md).
 Before changing what one covers, read it; if your change contradicts an

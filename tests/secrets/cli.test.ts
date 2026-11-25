@@ -37,7 +37,11 @@ describe('aib secret', { timeout: 30_000 }, () => {
     const again = aib(['add', 'db'], 'other-value-123');
     expect(again.code).toBe(1);
     expect(again.err).toMatch(/already exists/);
-    expect(aib(['add', 'db', '--replace'], 'other-value-123').code).toBe(0);
+    const noEnd = aib(['add', 'db', '--replace'], 'other-value-123');
+    expect(noEnd.code).toBe(1);
+    expect(noEnd.err).toContain('Replacing "db" must state its end');
+    expect(readFileSync(file, 'utf8')).toBe(VALUE);
+    expect(aib(['add', 'db', '--replace', '--no-end'], 'other-value-123').code).toBe(0);
     expect(readFileSync(file, 'utf8')).toBe('other-value-123');
     const list = aib(['list']);
     expect(list.out).toMatch(/^db\s+\d{4}-\d\d-\d\d \d\d:\d\d:\d\d UTC\s+Postgres$/m);
@@ -166,14 +170,14 @@ describe('aib secret', { timeout: 30_000 }, () => {
     writeFileSync(join(dir, 'index.json'), JSON.stringify(index));
     const run = aib(['run', 'k', '--', 'sh', '-c', 'cat "$SECRET_FILE"']);
     expect(run.code).toBe(4);
-    expect(run.err).toContain(`The secret "k" expired at ${past} and can no longer be used. Ask the person to renew it with the secret card.`);
+    expect(run.err).toContain(`The secret "k" expired at ${past} and can no longer be used. Ask the person to renew it.`);
     expect(run.out).not.toContain(VALUE);
     expect(existsSync(join(dir, 'k'))).toBe(false);
     expect(aib(['path', 'k']).code).toBe(4);
     const list = aib(['list']);
     expect(list.out).toMatch(new RegExp(`^k\\s+.*expired ${shown} UTC\\s+OpenAI$`, 'm'));
     expect(list.err).toContain(`Ended: k expired at ${shown} UTC.`);
-    expect(run.err).toContain('On this machine: aib secret add k --replace.');
+    expect(run.err).toContain('On this machine: aib secret add k --replace with --ends-in, --ends-at or --no-end.');
     const taken = aib(['add', 'k'], 'renewed-value');
     expect(taken.code).toBe(1);
     expect(taken.err).toContain(`"k" expired at ${shown} UTC; add --replace to renew it.`);
@@ -183,14 +187,14 @@ describe('aib secret', { timeout: 30_000 }, () => {
     const noYes = aib(['remove', 'k']);
     expect(noYes.code).toBe(1);
     expect(noYes.err).toContain('run again with --yes');
-    // Its moment has passed, so it cannot be kept: refused before the value is read.
+    // A replace must state its end: refused before the value is read.
     const keep = aib(['add', 'k', '--replace'], 'renewed-value');
     expect(keep.code).toBe(1);
-    expect(keep.err).toContain('so its end cannot be kept: renew it with --ends-in <duration> or --ends-at <time>, or --no-end for none.');
+    expect(keep.err).toContain('Replacing "k" must state its end: add --ends-in <duration> or --ends-at <time> (with --delete-at-end to delete it at the end), or --no-end for none. Nothing was changed.');
     expect(existsSync(join(dir, 'k'))).toBe(false);
     const renew = aib(['add', 'k', '--replace', '--no-end'], 'renewed-value');
     expect(renew.code).toBe(0);
-    expect(renew.out).toContain(`; its end (expired ${shown} UTC) is removed.`);
+    expect(renew.out).toContain('; it has no end.');
     expect(aib(['run', 'k', '--no-mask', '--', 'sh', '-c', 'cat "$SECRET_FILE"']).out).toBe('renewed-value');
   });
 
@@ -219,53 +223,61 @@ describe('aib secret', { timeout: 30_000 }, () => {
     aib(['add', 'plain'], VALUE);
     const alone = aib(['end', 'plain', '--expire']);
     expect(alone.code).toBe(1);
-    expect(alone.err).toContain('add --in <duration> or --at <time>.');
+    expect(alone.err).toContain('"plain" has no end yet: give the time it ends');
   });
 
-  it('add --replace keeps the end, says so, and changes or removes it only when asked', () => {
+  it('add --replace must state its end: an end flag or --no-end; the old end is never kept', () => {
+    const file = join(home, '.ai-bridge', 'secrets', 'k');
     aib(['add', 'k', '--ends-at', '2030-06-01T12:00:00Z', '--delete-at-end'], VALUE);
-    const kept = aib(['add', 'k', '--replace'], 'other-value-123');
-    expect(kept.code).toBe(0);
-    expect(kept.out).toMatch(/^Replaced "k" \(15 bytes\) in .*; its end is kept: deleted 2030-06-01 12:00:00 UTC\.$/m);
+    const bare = aib(['add', 'k', '--replace'], 'other-value-123');
+    expect(bare.code).toBe(1);
+    expect(bare.err).toContain('Replacing "k" must state its end');
+    expect(readFileSync(file, 'utf8')).toBe(VALUE);
     expect(aib(['list']).out).toMatch(/^k\s+.*deleted 2030-06-01 12:00:00 UTC$/m);
+    // An end flag without a kind flag expires: the old kind is not carried over either.
     const changed = aib(['add', 'k', '--replace', '--ends-at', '2031-01-01T00:00:00Z'], 'other-value-456');
-    expect(changed.out).toMatch(/; its end is now: deleted 2031-01-01 00:00:00 UTC\.$/m);
-    const toExpire = aib(['add', 'k', '--replace', '--ends-at', '2031-01-01T00:00:00Z', '--expire'], 'other-value-456');
-    expect(toExpire.out).toMatch(/; its end is now: expires 2031-01-01 00:00:00 UTC\.$/m);
+    expect(changed.code).toBe(0);
+    expect(changed.out).toMatch(/^Replaced "k" \(15 bytes\) in .*; it expires 2031-01-01 00:00:00 UTC\.$/m);
+    const toDelete = aib(['add', 'k', '--replace', '--ends-at', '2031-01-01T00:00:00Z', '--delete-at-end'], 'other-value-456');
+    expect(toDelete.out).toMatch(/; it is deleted 2031-01-01 00:00:00 UTC\.$/m);
     const removed = aib(['add', 'k', '--replace', '--no-end'], 'other-value-789');
-    expect(removed.out).toMatch(/; its end \(expires 2031-01-01 00:00:00 UTC\) is removed\.$/m);
+    expect(removed.out).toMatch(/; it has no end\.$/m);
     expect(aib(['list']).out).not.toMatch(/^k .*(expires|deleted) /m);
-    const plain = aib(['add', 'k', '--replace'], 'other-value-000');
-    expect(plain.out).toMatch(/^Replaced "k" \(15 bytes\) in [^;]*\.$/m);
+    for (const r of [bare, changed, toDelete, removed]) expect(r.out + r.err).not.toMatch(/other-value/);
   });
 
-  it('import --replace keeps the end like add --replace, and refuses to keep an expired one', () => {
+  it('--ends-at refuses a date or time that does not exist instead of rolling it over', () => {
+    for (const bad of [
+      '2027-02-30T12:00:00Z', '2027-02-29T12:00:00Z', '2027-04-31T12:00:00Z', '2027-13-01T00:00:00Z', '2027-00-10T00:00:00Z',
+      '2027-01-01T24:00:00Z', '2027-01-01T12:60:00Z', '2027-01-01T12:00:60Z', '2027-01-01T12:00:00+25:00', '2027-01-01T12:00:00+01:60',
+    ]) {
+      const r = aib(['add', 'x', '--ends-at', bad], VALUE);
+      expect(r.code, bad).toBe(1);
+      expect(r.err, bad).toContain('is not a time with a zone');
+    }
+    expect(existsSync(join(home, '.ai-bridge', 'secrets', 'x'))).toBe(false);
+    expect(aib(['add', 'leap', '--ends-at', '2028-02-29T23:30:00-01:00'], VALUE).out).toContain('it expires 2028-03-01 00:30:00 UTC.');
+    expect(aib(['add', 'frac', '--ends-at', '2028-01-01T00:00:00.000Z'], VALUE).code).toBe(0);
+    expect(aib(['add', 'frac2', '--ends-at', '2028-01-01T00:00:00.5Z'], VALUE).err).toContain('whole seconds');
+  });
+
+  it('import --replace must state its end like add --replace, and writes the one given or none', () => {
     const src = join(home, 'folder');
     mkdirSync(src);
     writeFileSync(join(src, 'k'), 'other-value-123');
     aib(['add', 'k', '--ends-in', '1w', '--delete-at-end'], VALUE);
-    const kept = aib(['import', src, '--replace']);
-    expect(kept.code).toBe(0);
-    expect(kept.out).toMatch(/^k: its end is kept: deleted \S+ \S+ UTC\.$/m);
+    const bare = aib(['import', src, '--replace']);
+    expect(bare.code).toBe(1);
+    expect(bare.err).toContain('Importing with --replace must state its end');
+    expect(readFileSync(join(home, '.ai-bridge', 'secrets', 'k'), 'utf8')).toBe(VALUE);
     expect(aib(['list']).out).toMatch(/^k\s+.*deleted \S+ \S+ UTC$/m);
-    const changed = aib(['import', src, '--replace', '--ends-at', '2031-01-01T00:00:00Z', '--expire']);
-    expect(changed.out).toMatch(/^k: its end is now: expires 2031-01-01 00:00:00 UTC\.$/m);
+    const changed = aib(['import', src, '--replace', '--ends-at', '2031-01-01T00:00:00Z']);
+    expect(changed.out).toMatch(/^k: it expires 2031-01-01 00:00:00 UTC\.$/m);
     const removed = aib(['import', src, '--replace', '--no-end']);
-    expect(removed.out).toMatch(/^k: its end \(expires 2031-01-01 00:00:00 UTC\) is removed\.$/m);
+    expect(removed.out).toMatch(/^k: it has no end\.$/m);
     expect(aib(['list']).out).not.toMatch(/^k .*(expires|deleted) /m);
     expect(aib(['import', src, '--no-end', '--ends-in', '1d']).err).toContain('--no-end removes the end');
     expect(aib(['import', src, '--delete-at-end']).err).toContain('What happens at the end needs an end');
-    for (const r of [kept, changed, removed]) expect(r.out + r.err).not.toContain('other-value-123');
-    const dir = join(home, '.ai-bridge', 'secrets');
-    const past = `${new Date(Date.now() - 3_600_000).toISOString().slice(0, 19)}Z`;
-    const index = JSON.parse(readFileSync(join(dir, 'index.json'), 'utf8')) as { secrets: Record<string, Record<string, unknown>> };
-    index.secrets['k'] = { ...index.secrets['k'], ends_at: past, end_kind: 'expire' };
-    writeFileSync(join(dir, 'index.json'), JSON.stringify(index));
-    expect(aib(['run', 'k', '--', 'true']).code).toBe(4);
-    const expired = aib(['import', src, '--replace']);
-    expect(expired.out).toContain('Skipped k: "k" expired at');
-    expect(expired.out).toContain('so its end cannot be kept: renew it with --ends-in <duration> or --ends-at <time>, or --no-end for none.');
-    expect(existsSync(join(dir, 'k'))).toBe(false);
+    for (const r of [bare, changed, removed]) expect(r.out + r.err).not.toContain('other-value-123');
   });
 });
-

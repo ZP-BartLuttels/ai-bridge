@@ -45,47 +45,51 @@ export function endIn(text: string, now: Date = new Date()): string {
   return formatEnd(new Date(Math.ceil((now.getTime() + Number(match[1]) * UNIT_MS[match[2]!]!) / 1000) * 1000));
 }
 
-/** An ISO time with a zone (`Z` or `+01:00`) as the store's UTC form; whole seconds only. */
+/** `YYYY-MM-DDTHH:MM:SS`, optional fraction, then `Z` or `+HH:MM` / `-HH:MM`. */
+const TIME_WITH_ZONE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/u;
+
+/**
+ * An ISO time with a zone (`Z` or `+01:00`) as the store's UTC form; whole
+ * seconds only. A date or time that does not exist (30 February, 24:00,
+ * minute 60, a zone of +25:00) is refused, never rolled over.
+ */
 export function endAt(text: string): string {
-  const parsed = /(Z|[+-]\d{2}:\d{2})$/u.test(text) ? Date.parse(text) : NaN;
-  if (!Number.isFinite(parsed)) {
-    throw new SecretRefusal('invalid_end', `"${text}" is not a time with a zone, like 2026-12-01T15:00:00Z or 2026-12-01T16:00:00+01:00.`);
-  }
-  if (parsed % 1000 !== 0) throw new SecretRefusal('invalid_end', 'An end is in whole seconds.');
-  return formatEnd(new Date(parsed));
+  const bad = (): SecretRefusal => new SecretRefusal(
+    'invalid_end', `"${text}" is not a time with a zone, like 2026-12-01T15:00:00Z or 2026-12-01T16:00:00+01:00.`,
+  );
+  const m = TIME_WITH_ZONE.exec(text);
+  if (!m) throw bad();
+  const [year, month, day, hour, minute, second] = m.slice(1, 7).map(Number) as [number, number, number, number, number, number];
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth || hour > 23 || minute > 59 || second > 59) throw bad();
+  if (m[8] !== undefined && (Number(m[9]) > 23 || Number(m[10]) > 59)) throw bad();
+  if (m[7] !== undefined && !/^\.0+$/u.test(m[7])) throw new SecretRefusal('invalid_end', 'An end is in whole seconds.');
+  const offsetMs = m[8] === undefined ? 0 : (m[8] === '-' ? -1 : 1) * (Number(m[9]) * 60 + Number(m[10])) * 60_000;
+  return formatEnd(new Date(Date.UTC(year, month - 1, day, hour, minute, second) - offsetMs));
 }
 
 /** An end as a put writes it. */
 type End = { endsAt: string; endKind: EndKind };
 
 /**
- * A replace without an end flag or --no-end keeps the secret's end; an
- * expired secret has none left to keep, so that is refused. One rule for
- * `add` and `import`, checked before the value is read.
+ * A replace must state its end: an end flag, or --no-end for none. Nothing of
+ * the old end is kept, so a forgotten flag can neither make a short-lived
+ * secret permanent nor leave an old end on a new value. One rule for `add`
+ * and `import`, checked before anything is read.
  */
-function checkKeepable(name: string, current: SecretRow | undefined, replace: boolean, given: End | null, noEnd: boolean): void {
-  if (replace && current?.expired_at && !given && !noEnd) {
+function requireEndOnReplace(replace: boolean, given: End | null, noEnd: boolean, what: string): void {
+  if (replace && !given && !noEnd) {
     throw new SecretRefusal(
-      'invalid_end',
-      `"${name}" expired at ${shownTime(current.expired_at)}, so its end cannot be kept: renew it with --ends-in <duration> or --ends-at <time>, or --no-end for none.`,
+      'end_required',
+      `${what} must state its end: add --ends-in <duration> or --ends-at <time> (with --delete-at-end to delete it at the end), or --no-end for none. Nothing was changed.`,
     );
   }
 }
 
-/** The end a put writes (the given one, or the kept one) and the words `add` and `import` print for it. */
-function endForPut(
-  current: SecretRow | undefined, replace: boolean, end: End | null, noEnd: boolean,
-): { final: End | null; words: (replaced: boolean) => string } {
-  const old: End | null = current?.ends_at ? { endsAt: current.ends_at, endKind: current.end_kind ?? 'expire' } : null;
-  const kept = replace && !end && !noEnd && !current?.expired_at ? old : null;
-  const words = (replaced: boolean): string => {
-    if (kept) return `its end is kept: ${endWords(kept.endsAt, kept.endKind)}`;
-    if (end && replaced && old && !current?.expired_at) return `its end is now: ${endWords(end.endsAt, end.endKind)}`;
-    if (end) return `it ${end.endKind === 'delete' ? 'is deleted' : 'expires'} ${shownTime(end.endsAt)}`;
-    if (replaced && old) return `its end (${current?.expired_at ? `expired ${shownTime(current.expired_at)}` : endWords(old.endsAt, old.endKind)}) is removed`;
-    return '';
-  };
-  return { final: end ?? kept, words };
+/** The words `add` and `import` print for the end a put wrote. */
+function endPutWords(end: End | null, replaced: boolean): string {
+  if (end) return `it ${end.endKind === 'delete' ? 'is deleted' : 'expires'} ${shownTime(end.endsAt)}`;
+  return replaced ? 'it has no end' : '';
 }
 
 /** The kind from --delete-at-end / --expire, and whether --no-end was given; contradictions refused. */
@@ -101,15 +105,15 @@ function endOptions(opts: { endsIn?: string; endsAt?: string; deleteAtEnd?: bool
 
 /** The end and kind from `--in`/`--ends-in` or `--at`/`--ends-at` and the kind flags, or null for none. */
 function endFromFlags(
-  inText: string | undefined, atText: string | undefined, kind: EndKind | undefined, fallback: EndKind = 'expire',
+  inText: string | undefined, atText: string | undefined, kind: EndKind | undefined,
   flags = '--ends-in <duration> or --ends-at <time>',
-): { endsAt: string; endKind: EndKind } | null {
+): End | null {
   if (inText !== undefined && atText !== undefined) throw new SecretRefusal('invalid_end', 'Give the end once: a duration or a time, not both.');
   if (inText === undefined && atText === undefined) {
     if (kind !== undefined) throw new SecretRefusal('invalid_end', `What happens at the end needs an end: add ${flags}.`);
     return null;
   }
-  return { endsAt: inText !== undefined ? endIn(inText) : endAt(atText!), endKind: kind ?? fallback };
+  return { endsAt: inText !== undefined ? endIn(inText) : endAt(atText!), endKind: kind ?? 'expire' };
 }
 
 /** A stored UTC time as `aib secret` prints it: `2026-12-01 15:00:00 UTC`. */
@@ -209,7 +213,7 @@ function readHiddenLine(): Promise<Buffer> {
 export interface ImportReport {
   imported: string[];
   skipped: Array<{ name: string; reason: string }>;
-  /** What happened to the end of each imported secret that has or had one, as `add` words it. */
+  /** The end each imported secret got (or, on a replace, that it has none), as `add` words it. */
   ends: Array<{ name: string; words: string }>;
 }
 
@@ -222,7 +226,7 @@ export interface ImportEnd {
   endsIn?: string;
   endsAt?: string;
   kind?: EndKind;
-  /** With replace: remove the end a secret has instead of keeping it. */
+  /** No end. With replace, this or an end is required (`end_required`). */
   noEnd?: boolean;
 }
 
@@ -235,9 +239,9 @@ export async function importFolder(
   const st = await lstat(root).catch(() => null);
   if (!st || !st.isDirectory()) throw new Error(`${root} is not a folder`);
   const report: ImportReport = { imported: [], skipped: [], ends: [] };
-  const given = endFromFlags(endsIn, endsAt, kind, 'expire');
+  const given = endFromFlags(endsIn, endsAt, kind);
+  requireEndOnReplace(replace, given, noEnd, 'Importing with --replace');
   if (given) checkEnd(given.endsAt, given.endKind, new Date());
-  const rows = await store.list();
   for (const name of (await readdir(root)).sort()) {
     if (name.startsWith('.')) continue;
     const path = join(root, name);
@@ -257,16 +261,14 @@ export async function importFolder(
       description = (await readFile(descPath, 'utf8')).trim() || undefined;
     }
     try {
-      const current = rows.find((r) => r.name === name);
-      const mine = endFromFlags(endsIn, endsAt, kind, current?.end_kind ?? 'expire');
-      checkKeepable(name, current, replace, mine, noEnd);
       const value = checkValue(await readValueFile(path), MAX_LOCAL_VALUE_BYTES);
-      const { final, words } = endForPut(current, replace, mine, noEnd);
       const { replaced } = await store.put(name, value, {
-        replace, description, maxBytes: MAX_LOCAL_VALUE_BYTES, endsAt: final?.endsAt, endKind: final?.endKind,
+        replace, description, maxBytes: MAX_LOCAL_VALUE_BYTES,
+        // A replace states its end every time: the given one, or null for none.
+        endsAt: given?.endsAt ?? (replace ? null : undefined), endKind: given?.endKind,
       });
       report.imported.push(name);
-      const said = words(replaced);
+      const said = endPutWords(given, replaced);
       if (said) report.ends.push({ name, words: said });
     } catch (err) {
       if (err instanceof SecretRefusal) {
@@ -314,13 +316,13 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
     .description('Add a secret; the value is read from stdin (or --from-file), never from an argument')
     .argument('<name>', 'Letters, digits, ".", "_" and "-", starting with a letter or digit')
     .option('--description <text>', 'What it is for')
-    .option('--replace', 'Overwrite a secret of the same name (it keeps its end unless an end flag or --no-end is given)')
+    .option('--replace', 'Overwrite a secret of the same name; needs an end flag or --no-end (the old end is not kept)')
     .option('--from-file <path>', 'Read the value from this file, as it is')
     .option('--ends-in <n>', 'End it after a while: a number and m, h, d or w (30m, 8h, 2d, 1w)')
     .option('--ends-at <time>', 'End it at this time, with a zone (2026-12-01T15:00:00Z)')
     .option('--delete-at-end', 'At the end delete it altogether (without this it expires: the value goes, the name stays)')
-    .option('--expire', 'At the end only remove the value (the default; on --replace it turns a deleting end into an expiring one)')
-    .option('--no-end', 'With --replace: remove the end it has')
+    .option('--expire', 'At the end only remove the value (the default)')
+    .option('--no-end', 'No end (with --replace: say so deliberately; any end it had is removed)')
     .action(async (name: string, opts: {
       description?: string; replace?: boolean; fromFile?: string; endsIn?: string; endsAt?: string;
       deleteAtEnd?: boolean; expire?: boolean; end: boolean;
@@ -328,26 +330,26 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
       try {
         const store = storeFor();
         const { kind, noEnd } = endOptions(opts);
-        // Refuse a bad end and a taken name before asking for the value.
-        const current = (await store.list()).find((r) => r.name === name);
+        // Refuse a bad end, a missing one and a taken name before asking for the value.
+        const given = endFromFlags(opts.endsIn, opts.endsAt, kind);
+        requireEndOnReplace(!!opts.replace, given, noEnd, `Replacing "${name}"`);
+        if (given) checkEnd(given.endsAt, given.endKind, new Date());
         if (!opts.replace) {
+          const current = (await store.list()).find((r) => r.name === name);
           if (current?.expired_at) {
             throw new SecretRefusal('exists', `"${name}" expired at ${shownTime(current.expired_at)}; add --replace to renew it.`);
           }
           if (await store.has(name)) throw new SecretRefusal('exists', `A secret called "${name}" already exists; add --replace to overwrite it.`);
         }
-        const given = endFromFlags(opts.endsIn, opts.endsAt, kind, current?.end_kind ?? 'expire');
-        if (given) checkEnd(given.endsAt, given.endKind, new Date());
-        checkKeepable(name, current, !!opts.replace, given, noEnd);
         const value = opts.fromFile !== undefined ? await readValueFile(resolve(opts.fromFile)) : await readValueFromStdin();
         // A duration counts from when the value was entered, not from when the command started.
         const end = given && opts.endsIn !== undefined ? { ...given, endsAt: endIn(opts.endsIn) } : given;
-        const { final, words } = endForPut(current, !!opts.replace, end, noEnd);
         const { replaced } = await store.put(name, value, {
           replace: !!opts.replace, description: opts.description, maxBytes: MAX_LOCAL_VALUE_BYTES,
-          endsAt: final?.endsAt, endKind: final?.endKind,
+          // A replace states its end every time: the given one, or null for none.
+          endsAt: end?.endsAt ?? (opts.replace ? null : undefined), endKind: end?.endKind,
         });
-        const said = words(replaced);
+        const said = endPutWords(end, replaced);
         console.log(`${replaced ? 'Replaced' : 'Added'} "${name}" (${value.length} bytes) in ${store.dir}${said ? `; ${said}` : ''}.`);
       } catch (err) { fail(err); }
     });
@@ -379,16 +381,13 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
           console.log(`"${name}" no longer ends.`);
           return;
         }
-        const store = storeFor();
-        const noTime = inText === undefined && atText === undefined;
+        if (inText !== undefined && atText !== undefined) throw new SecretRefusal('invalid_end', 'Give the end once: a duration or a time, not both.');
+        if (inText === undefined && atText === undefined && kind === undefined) throw new SecretRefusal('invalid_end', 'Give --in, --at or --none.');
         // Without a kind flag a secret that already ends keeps its kind; a kind flag alone keeps its time.
-        const current = kind === undefined || noTime ? (await store.list()).find((r) => r.name === name) : undefined;
-        const end = noTime && kind !== undefined && current?.ends_at && !current.expired_at
-          ? { endsAt: current.ends_at, endKind: kind }
-          : endFromFlags(inText, atText, kind, current?.end_kind ?? 'expire', '--in <duration> or --at <time>');
-        if (!end) throw new SecretRefusal('invalid_end', 'Give --in, --at or --none.');
-        await store.setEnd(name, end.endsAt, end.endKind);
-        console.log(`"${name}" ${end.endKind === 'delete' ? 'is deleted' : 'expires'} ${shownTime(end.endsAt)}.`);
+        // Both are read and written under the store's lock (adjustEnd), never read here and written back.
+        const endsAt = inText !== undefined ? endIn(inText) : atText !== undefined ? endAt(atText) : undefined;
+        const end = await storeFor().adjustEnd(name, { endsAt, endKind: kind });
+        console.log(`"${name}" ${end.end_kind === 'delete' ? 'is deleted' : 'expires'} ${shownTime(end.ends_at)}.`);
       } catch (err) { fail(err); }
     });
 
@@ -458,12 +457,12 @@ export function registerSecretCommands(program: Command, storeFor: () => Machine
     .command('import')
     .description('Copy a folder of one file per secret (and .desc/<name> descriptions) into the store; the folder is left as it is')
     .argument('<folder>')
-    .option('--replace', 'Overwrite secrets that already exist (each keeps its end unless an end flag or --no-end is given)')
+    .option('--replace', 'Overwrite secrets that already exist; needs an end flag or --no-end (old ends are not kept)')
     .option('--ends-in <n>', 'End every imported secret after a while: a number and m, h, d or w (30m, 8h, 2d, 1w)')
     .option('--ends-at <time>', 'End every imported secret at this time, with a zone (2026-12-01T15:00:00Z)')
     .option('--delete-at-end', 'At the end delete them altogether (without this they expire)')
-    .option('--expire', 'At the end only remove the value (the default; with an end flag on --replace it turns a deleting end into an expiring one)')
-    .option('--no-end', 'With --replace: remove the end each one has')
+    .option('--expire', 'At the end only remove the value (the default)')
+    .option('--no-end', 'No end (with --replace: say so deliberately; any end they had is removed)')
     .action(async (folder: string, opts: {
       replace?: boolean; endsIn?: string; endsAt?: string; deleteAtEnd?: boolean; expire?: boolean; end: boolean;
     }) => {

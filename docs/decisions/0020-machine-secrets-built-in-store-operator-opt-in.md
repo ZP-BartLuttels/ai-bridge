@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-11-21
 supersedes:
-superseded_by:
+superseded_by: 0023 (in part: the folder is no longer the only truth about which secrets exist; the index holds ends)
 revisit_when: a value has to be readable by the server, secrets need encryption at rest or a separate OS user, a turn's output has to be scrubbed of stored values, or the 16 KB prompt cap is too small
 ---
 # Machine secrets: a built-in store, managed by a server only with the operator's opt-in

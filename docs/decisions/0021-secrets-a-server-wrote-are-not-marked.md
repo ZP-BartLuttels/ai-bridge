@@ -2,7 +2,7 @@
 status: accepted
 date: 2026-11-22
 supersedes:
-superseded_by:
+superseded_by: 0023 (in part: index.json gains ends and version 2)
 revisit_when: a server can write machine secrets without also being able to run turns with a shell on that machine, or a secret's origin has to be shown to the person for another reason (an audit on the machine itself)
 ---
 # Secrets a server wrote are treated like the ones the person added

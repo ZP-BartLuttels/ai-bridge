@@ -27,6 +27,7 @@ history. Format: Engram documentation standard v1, section 3.
 | [0017](0017-claude-token-file-read-per-run.md) | The Claude token file may hold several named tokens and is read for every run | accepted | 2026-11-15 |
 | [0018](0018-claude-sign-in-profiles-saved-back-before-a-switch.md) | Claude sign-in profiles, saved back before every switch | accepted | 2026-11-15 |
 | [0019](0019-the-repository-names-no-downstream-project.md) | The repository names no downstream project; history is kept and mapped | accepted | 2026-11-21 |
-| [0020](0020-machine-secrets-built-in-store-operator-opt-in.md) | Machine secrets: a built-in store, managed by a server only with the operator's opt-in | accepted | 2026-11-21 |
-| [0021](0021-secrets-a-server-wrote-are-not-marked.md) | Secrets a server wrote are treated like the ones the person added | accepted | 2026-11-22 |
+| [0020](0020-machine-secrets-built-in-store-operator-opt-in.md) | Machine secrets: a built-in store, managed by a server only with the operator's opt-in | accepted, in part superseded by 0023 | 2026-11-21 |
+| [0021](0021-secrets-a-server-wrote-are-not-marked.md) | Secrets a server wrote are treated like the ones the person added | accepted, in part superseded by 0023 | 2026-11-22 |
 | [0022](0022-readable-store-warns-prompt-injection-out-of-scope.md) | A store a turn could read is a startup warning; prompt injection is outside the threat model | accepted | 2026-11-22 |
+| [0023](0023-secrets-may-end-a-replace-states-its-end.md) | Machine secrets may end, the machine enforces it, and a replace always states its end | accepted | 2026-11-25 |

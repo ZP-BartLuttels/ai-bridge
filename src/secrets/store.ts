@@ -5,10 +5,12 @@
  * `~/.ai-bridge/secrets/` (0700), one file per secret named exactly like the
  * secret (0600 from the moment it exists), and `index.json` (0600) holding
  * each secret's description, when it was last written and its end, if any.
- * The folder is the truth about which secrets exist; the index adds words
- * and dates, and the ends that stop a secret, and keeps an expired secret's
- * entry after its file is gone. Because it holds the ends, an index that
- * exists but cannot be read is refused (`store_unavailable`), never read as empty.
+ * A value file is a secret only while the index does not say it has ended;
+ * the index adds words and dates, holds the ends that stop a secret, and keeps
+ * an expired secret's entry after its file is gone (decision 0023). Because it
+ * holds the ends, an index that exists but cannot be read, or that a newer
+ * format wrote (`version` above INDEX_VERSION), is refused (`store_unavailable`),
+ * never read as empty.
  *
  * An end (`ends_at`, `end_kind`) is enforced by `sweep()`, which runs before
  * every read: `expire` removes the value file and keeps the entry with
@@ -61,6 +63,12 @@ export const ENDED_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
 export const ENDED_KEEP_MAX = 100;
 /** How far ahead an end may be set. */
 export const MAX_END_YEARS = 10;
+/**
+ * The `version` this code writes in `index.json`, and the highest it reads.
+ * 1: descriptions and dates. 2: also ends and ended records. An older aib or
+ * bridge does not read `version` at all (decision 0023 says what a rollback does).
+ */
+export const INDEX_VERSION = 2;
 /** An end as the store keeps it: UTC, whole seconds, `Z`. */
 const END_TIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u;
 
@@ -72,6 +80,7 @@ export type SecretCode =
   | 'invalid_request'
   | 'exists'
   | 'invalid_end'
+  | 'end_required'
   | 'ended'
   | 'expired'
   | 'timeout'
@@ -209,8 +218,10 @@ export function checkEnd(endsAt: unknown, endKind: unknown, now: Date): SecretEn
   if (endKind !== 'expire' && endKind !== 'delete') {
     throw new SecretRefusal('invalid_end', 'end_kind must be "expire" or "delete".');
   }
-  // The round trip refuses a date that does not exist, such as 30 February.
-  if (typeof endsAt !== 'string' || !END_TIME.test(endsAt) || formatEnd(new Date(endsAt)) !== endsAt) {
+  // The round trip refuses a date that does not exist, such as 30 February;
+  // one JavaScript cannot read at all (month 13, minute 60) is refused before it.
+  if (typeof endsAt !== 'string' || !END_TIME.test(endsAt) || !Number.isFinite(Date.parse(endsAt))
+    || formatEnd(new Date(endsAt)) !== endsAt) {
     throw new SecretRefusal('invalid_end', 'ends_at must be a UTC time in whole seconds, like 2026-12-01T15:00:00Z.');
   }
   const at = Date.parse(endsAt);
@@ -318,8 +329,10 @@ export class MachineSecretStore {
   /**
    * Add a secret, or replace one when `replace` is true. An existing name is
    * refused with `exists` before anything is written; an expired one counts
-   * as existing, and replacing it renews it. The end is the one given, or
-   * none: a replace without one clears the old end.
+   * as existing, and replacing it renews it. A replace must state its end:
+   * `endsAt` a time (with `endKind`) or null for none; left out (undefined) it
+   * is refused with `end_required` before anything is read or written, so a
+   * forgotten end never silently keeps or drops one. The old end is never kept.
    */
   async put(
     name: unknown,
@@ -337,6 +350,12 @@ export class MachineSecretStore {
     const description = options.description === undefined || options.description === null || options.description === ''
       ? undefined
       : checkDescription(options.description);
+    if (options.replace === true && options.endsAt === undefined) {
+      throw new SecretRefusal(
+        'end_required',
+        'Replacing a secret must state its end: ends_at with a time and end_kind, or ends_at null for no end. Nothing was changed.',
+      );
+    }
     const end = checkEnd(options.endsAt, options.endKind, this.now());
     await this.checkDir(true);
     return this.locked(async () => {
@@ -403,6 +422,35 @@ export class MachineSecretStore {
     });
   }
 
+  /**
+   * For `aib secret end`: change one part of a secret's end and keep the other
+   * as it is now, read and written under one lock, so a writer in between
+   * cannot be undone. Without `endsAt` the time it has is kept (refused when it
+   * has none); without `endKind` the kind it has, else `expire`.
+   */
+  async adjustEnd(name: unknown, change: { endsAt?: string; endKind?: EndKind }): Promise<SecretEnd> {
+    const checkedName = checkName(name);
+    if (!(await this.checkDir(false))) throw this.notFound(checkedName);
+    return this.locked(async () => {
+      const now = this.now();
+      await this.sweepLocked(now);
+      const index = await this.readIndex();
+      const entry = index.secrets[checkedName];
+      if (typeof entry?.expired_at === 'string') throw this.alreadyExpired(checkedName);
+      if (!(await this.existingFile(join(this.dir, checkedName)))) throw this.notFound(checkedName);
+      const current = typeof entry?.ends_at === 'string' ? entry.ends_at : undefined;
+      const endsAt = change.endsAt ?? current;
+      if (endsAt === undefined) {
+        throw new SecretRefusal('invalid_end', `"${checkedName}" has no end yet: give the time it ends (aib secret end ${checkedName} --in <duration> or --at <time>).`);
+      }
+      const endKind = change.endKind ?? (current !== undefined ? endKindOf(entry!) : 'expire');
+      const end = checkEnd(endsAt, endKind, now)!;
+      index.secrets[checkedName] = { ...(entry ?? {}), ...end };
+      await this.writeIndex(index);
+      return end;
+    });
+  }
+
   /** Change a secret's description; an empty text clears it. */
   async describe(name: unknown, description: unknown): Promise<void> {
     const checkedName = checkName(name);
@@ -446,7 +494,7 @@ export class MachineSecretStore {
     if (typeof expiredAt === 'string') {
       throw new SecretRefusal(
         'expired',
-        `The secret "${checkedName}" expired at ${expiredAt} and can no longer be used. Ask the person to renew it with the secret card. On this machine: aib secret add ${checkedName} --replace.`,
+        `The secret "${checkedName}" expired at ${expiredAt} and can no longer be used. Ask the person to renew it. On this machine: aib secret add ${checkedName} --replace with --ends-in, --ends-at or --no-end.`,
       );
     }
     const target = join(this.dir, checkedName);
@@ -529,7 +577,7 @@ export class MachineSecretStore {
   private alreadyExpired(name: string): SecretRefusal {
     return new SecretRefusal(
       'ended',
-      `The secret "${name}" has already expired; replace it to renew it (on this machine: aib secret add ${name} --replace).`,
+      `The secret "${name}" has already expired; replace it to renew it (on this machine: aib secret add ${name} --replace with --ends-in, --ends-at or --no-end).`,
     );
   }
 
@@ -633,15 +681,23 @@ export class MachineSecretStore {
       if (errno(err) === 'ENOENT') return out;
       throw this.damagedIndex();
     }
-    let parsed: { secrets?: unknown; ended?: unknown };
+    let parsed: { version?: unknown; secrets?: unknown; ended?: unknown };
     try {
-      parsed = JSON.parse(text) as { secrets?: unknown; ended?: unknown };
+      parsed = JSON.parse(text) as { version?: unknown; secrets?: unknown; ended?: unknown };
     } catch {
       throw this.damagedIndex();
     }
     // The index holds the ends: one that cannot be read must not let every secret go endless.
     const isObject = (v: unknown): boolean => typeof v === 'object' && v !== null && !Array.isArray(v);
     if (!isObject(parsed) || (parsed.secrets !== undefined && !isObject(parsed.secrets))) throw this.damagedIndex();
+    // A format this code does not know may hold rules it would not keep: refused, never rewritten.
+    if (parsed.version !== undefined && (typeof parsed.version !== 'number' || !Number.isInteger(parsed.version)
+      || parsed.version < 1 || parsed.version > INDEX_VERSION)) {
+      throw new SecretRefusal(
+        'store_unavailable',
+        `The index ${join(this.dir, INDEX_FILE)} has a format this version does not know (version ${typeof parsed.version === 'number' ? parsed.version : typeof parsed.version}); update ai-bridge to use the store.`,
+      );
+    }
     for (const [name, entry] of Object.entries((parsed.secrets ?? {}) as Record<string, unknown>)) {
       if (isValidName(name) && typeof entry === 'object' && entry !== null) out.secrets[name] = entry as IndexEntry;
     }
@@ -666,7 +722,7 @@ export class MachineSecretStore {
   private async writeIndex(index: IndexFile): Promise<void> {
     const sorted = Object.create(null) as Record<string, IndexEntry>;
     for (const name of Object.keys(index.secrets).sort()) sorted[name] = index.secrets[name]!;
-    const body = { version: 1, secrets: sorted, ...(index.ended.length ? { ended: index.ended } : {}) };
+    const body = { version: INDEX_VERSION, secrets: sorted, ...(index.ended.length ? { ended: index.ended } : {}) };
     await this.writeAtomic(join(this.dir, INDEX_FILE), Buffer.from(`${JSON.stringify(body, null, 2)}\n`));
   }
 

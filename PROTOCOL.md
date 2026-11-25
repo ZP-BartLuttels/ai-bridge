@@ -2662,8 +2662,8 @@ The person on the machine uses the same store with `aib secret ...` (README,
 | Server → Bridge | The bridge |
 |---|---|
 | `secret_list {id}` | lists the store: names, descriptions, dates, ends; and the ends handled recently |
-| `secret_put {id, name, value, description?, replace?, ends_at?, end_kind?}` | refuses an existing name with `exists` unless `replace` is `true` (an expired secret's name is taken too); then writes the value (a new file, mode 0600, renamed into place). A replace without `description` keeps the old one. The end is the one sent, or none: a replace without `ends_at`/`end_kind` clears the old end (a server resends the end it wants to keep; `aib secret add --replace` keeps it on its own side), and a replace of an expired secret renews it |
-| `secret_set_end {id, name, ends_at, end_kind}` | revision 3: sets the end, or removes it with `ends_at: null`. `end_kind` is required with a time (without it: `invalid_end`) and omitted with `null` (ignored if sent). The bridge never keeps the old kind for a server; `aib secret end` does that on its own side, as a convenience of the command line. Leaves the value and the description alone |
+| `secret_put {id, name, value, description?, replace?, ends_at?, end_kind?}` | refuses an existing name with `exists` unless `replace` is `true` (an expired secret's name is taken too); then writes the value (a new file, mode 0600, renamed into place). A replace without `description` keeps the old one. **A replace must carry the `ends_at` key** (revision 3): a time with `end_kind`, or `null` for deliberately no end; without the key it is refused with `end_required` and nothing changes. The old end is never kept: the end is the one sent. A first put (no `replace`) may leave `ends_at` out (no end). A replace of an expired secret renews it |
+| `secret_set_end {id, name, ends_at, end_kind}` | revision 3: sets the end, or removes it with `ends_at: null`. `end_kind` is required with a time (without it: `invalid_end`) and omitted with `null` (ignored if sent). The bridge never keeps the old kind for a server; `aib secret end` does that on the machine, reading and writing under the store's lock, as a convenience of the command line. Leaves the value and the description alone |
 | `secret_describe {id, name, description}` | sets the description; `""` clears it (an expired secret's too) |
 | `secret_remove {id, name}` | deletes the secret and its description (an expired one too) |
 
@@ -2685,12 +2685,13 @@ Each is answered exactly once with
 | Code | Meaning |
 |---|---|
 | `machine_secrets_unsupported` | The bridge was not started with `--machine-secrets`. |
-| `store_unavailable` | The store folder is unsafe or unreadable: a symlink, not owned by the bridge's user, open to the group or others, or a secret that is not a regular file. The error says which; the bridge never repairs it. |
+| `store_unavailable` | The store folder is unsafe or unreadable: a symlink, not owned by the bridge's user, open to the group or others, a secret that is not a regular file, or an `index.json` that cannot be read or has a `version` this bridge does not know. The error says which; the bridge never repairs it. |
 | `not_found` | No secret by that name. |
 | `exists` | The name is taken and `replace` was not `true`. When the name is an expired secret's, the error says so (it expired at a time; replace it to renew it). |
 | `invalid_name` | The name broke the rules below. |
 | `invalid_request` | A missing or empty value, a value over 64 KiB, a description over 1000 characters or holding a control character other than tab and newline. |
-| `invalid_end` | Revision 3: an end that breaks the rules in [Revision 3](#revision-3-secrets-with-an-end): one of `ends_at`/`end_kind` without the other, an unknown kind, not a UTC time in whole seconds, not in the future, more than 10 years ahead; or a `secret_set_end` without `ends_at`. |
+| `invalid_end` | Revision 3: an end that breaks the rules in [Revision 3](#revision-3-secrets-with-an-end): one of `ends_at`/`end_kind` without the other, an unknown kind, not a UTC time in whole seconds (a date or time that does not exist, such as 30 February or minute 60, included), not in the future, more than 10 years ahead; or a `secret_set_end` without `ends_at`. |
+| `end_required` | Revision 3: a `secret_put` with `replace: true` and no `ends_at` key. Nothing was changed; send it again with `ends_at` (a time and `end_kind`, or `null` for no end). |
 | `ended` | Revision 3: `secret_set_end` on a secret that already expired. A `secret_put` with `replace: true` renews it. This code means "already expired"; `aib secret run` and `path` refuse the same state with their own code `expired` (local to the command line, never sent to a server). |
 | `timeout` | The store did not answer within 15 s. It may still finish: **the result is unknown, list again before retrying.** |
 | `failed` | Anything else (a full disk, the folder busy for more than 5 s). |
@@ -2707,9 +2708,18 @@ A secret may carry an end: `ends_at` (ISO 8601 UTC, whole seconds, `Z`, e.g.
 
 ```json
 {"type": "secret_put", "id": "sec-1", "name": "rpa-pass", "value": "…", "replace": false, "ends_at": "2026-11-24T17:00:00Z", "end_kind": "delete"}
-{"type": "secret_set_end", "id": "sec-2", "name": "openai-key", "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
-{"type": "secret_set_end", "id": "sec-3", "name": "openai-key", "ends_at": null}
+{"type": "secret_put", "id": "sec-2", "name": "openai-key", "value": "…", "replace": true, "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
+{"type": "secret_put", "id": "sec-3", "name": "build-token", "value": "…", "replace": true, "ends_at": null}
+{"type": "secret_set_end", "id": "sec-4", "name": "openai-key", "ends_at": "2026-12-01T15:00:00Z", "end_kind": "expire"}
+{"type": "secret_set_end", "id": "sec-5", "name": "openai-key", "ends_at": null}
 ```
+
+- **A replace states its end.** A `secret_put` with `replace: true` must carry
+  `ends_at`: a time (with `end_kind`) or `null`. Without the key it is refused
+  with `end_required` before anything is read or written. The old end is never
+  kept, so a caller that rotates a key and forgets the end can neither make a
+  short-lived secret permanent nor leave an old end on the new value: it is
+  told, and sends the end it means. A first put keeps `ends_at` optional.
 
 - **`expire`:** at `ends_at` the value file is removed; the entry stays, with
   `expired_at` equal to `ends_at` (not the moment the bridge noticed). The
@@ -2737,13 +2747,23 @@ A secret may carry an end: `ends_at` (ISO 8601 UTC, whole seconds, `Z`, e.g.
   removed by the next sweep, which is within a minute on a bridge with
   `--machine-secrets` and otherwise the next `aib secret` command, not at the
   end itself.
+- **The machine's clock decides.** An end is compared with the system clock of
+  the machine; a clock set back keeps a secret usable longer, one set forward
+  ends it early.
 - **The store's index holds the ends.** An `index.json` that exists but cannot
   be read is refused with `store_unavailable` (nothing is listed or used, and
-  nothing overwrites it), never read as empty.
+  nothing overwrites it), never read as empty. The index says `"version": 2`;
+  one with a `version` above what the bridge knows is refused the same way.
+  Bridges and `aib` before revision 3 do not read `version` at all: rolled back
+  to one, a machine uses every secret whose value file is still there without
+  its end, and an older replace drops that secret's end (decision 0023).
 - **A server sends no end to a bridge below revision 3.** An older bridge
   would ignore `ends_at` and keep the secret forever, and answer
   `secret_set_end` as an unknown type (no `secret_result` at all), so a server
   refuses such a request itself.
+- **A server written for revision 2 cannot replace on a revision 3 bridge.**
+  Its replace carries no `ends_at` and is answered `end_required` (nothing
+  changed). Adding a secret, listing, describing and removing work as before.
 
 ### Rules the bridge holds
 
@@ -3082,7 +3102,7 @@ The protocol version is exchanged during handshake (`hello.version`). The server
 
 **Machine secrets do not bump the version.** `hello.machine_secrets`, the `secret_*` frames and `secret_result` are additive; their shape is versioned by `hello.machine_secrets.revision`, and a server must not send a `secret_*` frame to a bridge without it.
 
-**Secrets with an end do not bump the version.** Revision 3 of `hello.machine_secrets` adds `secret_set_end`, the optional `ends_at`/`end_kind` on `secret_put`, and `ends_at`, `end_kind`, `expired_at` and `ended` on the `secret_list` answer; a server reads them as absent from an older bridge and must not send an end or `secret_set_end` to a bridge below revision 3.
+**Secrets with an end do not bump the version.** Revision 3 of `hello.machine_secrets` adds `secret_set_end`, `ends_at`/`end_kind` on `secret_put` (optional on a first put, `ends_at` required on a replace: `end_required`), and `ends_at`, `end_kind`, `expired_at` and `ended` on the `secret_list` answer; a server reads them as absent from an older bridge and must not send an end or `secret_set_end` to a bridge below revision 3. The one change that is not additive: a server's replace without `ends_at` is refused by a revision 3 bridge, so a server sends `ends_at` (a time, or `null`) on every replace to a bridge at revision 3 or above.
 
 **The larger prompt cap does not bump the version.** `hello.bridge_prompt_max_bytes` is additive; a server keeps `bridge_prompt.text` within 8 KB for a bridge without it.
 

@@ -118,7 +118,10 @@ describe('a bridge with --machine-secrets', () => {
     expect(statSync(secretsDir()).mode & 0o777).toBe(0o700);
     expect(await ask({ type: 'secret_put', name: 'db_password', value: 'other' }))
       .toMatchObject({ ok: false, code: 'exists' });
-    expect(await ask({ type: 'secret_put', name: 'db_password', value: VALUE, replace: true }))
+    const noEnd = await ask({ type: 'secret_put', name: 'db_password', value: 'other-value-123', replace: true });
+    expect(noEnd).toMatchObject({ ok: false, code: 'end_required' });
+    expect(JSON.stringify(noEnd)).not.toContain('other-value-123');
+    expect(await ask({ type: 'secret_put', name: 'db_password', value: VALUE, replace: true, ends_at: null }))
       .toMatchObject({ ok: true, replaced: true });
     const listed = await ask({ type: 'secret_list' });
     expect(listed).toMatchObject({ ok: true, secrets: [{ name: 'db_password', description: 'Postgres' }] });
@@ -199,7 +202,7 @@ describe('secrets with an end (revision 3)', () => {
       ended: [{ name: 'k', kind: 'expire', ended_at: PASSED }],
     });
     expect(await ask({ type: 'secret_set_end', name: 'k', ends_at: null })).toMatchObject({ ok: false, code: 'ended' });
-    expect(await ask({ type: 'secret_put', name: 'k', value: VALUE, replace: true })).toMatchObject({ ok: true, replaced: true });
+    expect(await ask({ type: 'secret_put', name: 'k', value: VALUE, replace: true, ends_at: null })).toMatchObject({ ok: true, replaced: true });
     expect(await ask({ type: 'secret_list' })).toMatchObject({ secrets: [{ name: 'k', expired_at: null, ends_at: null }] });
     closeLogFile();
     const log = readFileSync(logFile, 'utf8');
